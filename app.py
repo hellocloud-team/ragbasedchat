@@ -1,4 +1,4 @@
-
+##Originator Sourav
 import streamlit as st
 from PyPDF2 import PdfReader #library to read pdf files
 from langchain.text_splitter import RecursiveCharacterTextSplitter#library to split pdf files
