@@ -20,3 +20,45 @@ Question Answering Chain with LangChain: LangChain's question-answering capabili
 Prompt Templates with LangChain: Using predefined templates from the LangChain prompt library can streamline interactions and provide users with prompts for generating responses.
 Dotenv Integration: Dotenv integration ensures that sensitive credentials and environment variables are securely managed within the application.
 ![image](https://github.com/hellocloud-team/ragbasedchat/assets/163302215/1732d9b7-803a-4f67-b0d1-18721100fd84)
+
+
+
+
+
+Training Takeaways: Secure LLMs, Agentic AI & AI-Powered Java Applications
+
+1. Building Secure LLMs (Large Language Models):
+
+Data Security: Emphasize proper data sanitization and encryption throughout the pipeline—especially during data ingestion and storage.
+
+Access Control: Implement strict access policies for LLM models, APIs, and inference endpoints.
+
+Prompt Injection Defense: Use input validation, context separation, and guardrails to protect against prompt injection attacks.
+
+Auditability: Ensure logging and monitoring are in place to track model usage, anomalies, and abuse patterns.
+
+Ethical Safeguards: Integrate content filters, bias mitigation strategies, and explainability tools.
+
+
+2. Developing Agentic AI Systems:
+
+Autonomy with Oversight: Build agents that act autonomously but remain aligned with human objectives via continuous feedback loops.
+
+Modular Architecture: Use composable tools like planners, memory modules, and tool interfaces for scalable design.
+
+State Management: Implement persistent and contextual memory systems for long-term agent reasoning.
+
+Security Controls: Prevent agents from taking harmful actions by enforcing constraints and validation at decision points.
+
+
+3. AI-Powered Application Development with Java:
+
+Framework Integration: Leverage Java ML libraries (e.g., Deep Java Library, Tribuo) or call Python models using JNI or REST APIs.
+
+Microservices Architecture: Deploy AI functionalities as modular, secure microservices for scalability and maintainability.
+
+Data Pipeline Handling: Use Java for robust ETL pipelines to prepare and manage input data for AI models.
+
+Inference Management: Optimize model inference with caching, batching, and concurrency control in Java applications.
+
+Monitoring & Logging: Use tools like Micrometer and Prometheus for observability of AI features in production.
