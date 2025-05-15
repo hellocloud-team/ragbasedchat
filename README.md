@@ -62,3 +62,47 @@ Data Pipeline Handling: Use Java for robust ETL pipelines to prepare and manage 
 Inference Management: Optimize model inference with caching, batching, and concurrency control in Java applications.
 
 Monitoring & Logging: Use tools like Micrometer and Prometheus for observability of AI features in production.
+
+
+
+
+#!/bin/bash
+
+# Function to validate input format
+validate_input() {
+    local input="$1"
+    
+    # Regular expression:
+    # - DYNAMIC_APP: Uppercase letters, numbers, hyphens, 1-63 chars
+    # - Static part: _NONPROD_K8S@
+    # - DYNAMIC_EC_DT: Uppercase letters, numbers, hyphens, 1-63 chars
+    # - Each dynamic part: Starts/ends with alphanumeric
+    local regex='^[A-Z0-9]([A-Z0-9-]{0,61}[A-Z0-9])?_NONPROD_K8S@[A-Z0-9]([A-Z0-9-]{0,61}[A-Z0-9])?$'
+
+    # Check if input matches the regex
+    if [[ ! "$input" =~ $regex ]]; then
+        echo "Error: Input '$input' does not match the <APP>_NONPROD_K8S@<EC-DT> format. It must:"
+        echo "- Follow the structure: <APP>_NONPROD_K8S@<EC-DT>"
+        echo "- APP and EC-DT: Uppercase letters, numbers, hyphens, 1-63 chars"
+        echo "- APP and EC-DT: Start and end with alphanumeric characters"
+        echo "- Include '_NONPROD_K8S@' exactly between APP and EC-DT"
+        return 1
+    fi
+
+    echo "Input '$input' is valid"
+    return 0
+}
+
+# Main script
+echo "Enter the input value (format like <APP>_NONPROD_K8S@<EC-DT>):"
+read -r input
+
+# Check if input is empty
+if [[ -z "$input" ]]; then
+    echo "Error: Input cannot be empty"
+    exit 1
+fi
+
+# Validate the input
+validate_input "$input"
+exit $?
