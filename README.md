@@ -1,29 +1,33 @@
 
 (
   (
-    100 - avg by(agent_hostname)(
+    (100 - avg by(agent_hostname)(
       rate(node_cpu_seconds_total{agent_hostname=~"(?i:($hostname))", mode="idle"}[$interval])
-    ) * 100
-  ) < 90
-)
-and on(agent_hostname)
-(
-  avg by(agent_hostname)(
-    (node_memory_MemTotal_bytes{agent_hostname=~"(?i:($hostname))"} - node_memory_MemAvailable_bytes{agent_hostname=~"(?i:($hostname))"})
-    / node_memory_MemTotal_bytes{agent_hostname=~"(?i:($hostname))"} * 100
-  ) < 90
-)
-and on(agent_hostname)
-(
-  avg by(agent_hostname)(
+    ) * 100) < 90
+  )
+  and on(agent_hostname)
+  (
     (
-      node_filesystem_size_bytes{agent_hostname=~"(?i:($hostname))", mountpoint="/"} 
-      - node_filesystem_free_bytes{agent_hostname=~"(?i:($hostname))", mountpoint="/"}
+      avg by(agent_hostname)(
+        (
+          node_memory_MemTotal_bytes{agent_hostname=~"(?i:($hostname))"} 
+          - node_memory_MemAvailable_bytes{agent_hostname=~"(?i:($hostname))"}
+        ) / node_memory_MemTotal_bytes{agent_hostname=~"(?i:($hostname))"} * 100
+      ) < 90
     )
-    / node_filesystem_size_bytes{agent_hostname=~"(?i:($hostname))", mountpoint="/"} * 100
-  ) < 90
-)
-* 1
+  )
+  and on(agent_hostname)
+  (
+    (
+      avg by(agent_hostname)(
+        (
+          node_filesystem_size_bytes{agent_hostname=~"(?i:($hostname))", mountpoint="/"} 
+          - node_filesystem_free_bytes{agent_hostname=~"(?i:($hostname))", mountpoint="/"}
+        ) / node_filesystem_size_bytes{agent_hostname=~"(?i:($hostname))", mountpoint="/"} * 100
+      ) < 90
+    )
+  )
+) * 1
 
 
 
