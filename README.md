@@ -1,5 +1,4 @@
 
-
 (
   (
     100 - avg by(agent_hostname)(
