@@ -1,35 +1,30 @@
 
-(
-  (
-    (100 - avg by(agent_hostname)(
-      rate(node_cpu_seconds_total{agent_hostname=~"(?i:($hostname))", mode="idle"}[$interval])
-    ) * 100) < 90
-  )
-  and on(agent_hostname)
+min(
   (
     (
-      avg by(agent_hostname)(
-        (
-          node_memory_MemTotal_bytes{agent_hostname=~"(?i:($hostname))"} 
-          - node_memory_MemAvailable_bytes{agent_hostname=~"(?i:($hostname))"}
-        ) / node_memory_MemTotal_bytes{agent_hostname=~"(?i:($hostname))"} * 100
-      ) < 90
+      (100 - avg by(agent_hostname)(
+        rate(node_cpu_seconds_total{agent_hostname=~"$hostname", mode="idle"}[5m])
+      ) * 100) < bool 90
     )
-  )
-  and on(agent_hostname)
-  (
+    and on(agent_hostname)
     (
-      avg by(agent_hostname)(
-        (
-          node_filesystem_size_bytes{agent_hostname=~"(?i:($hostname))", mountpoint="/"} 
-          - node_filesystem_free_bytes{agent_hostname=~"(?i:($hostname))", mountpoint="/"}
-        ) / node_filesystem_size_bytes{agent_hostname=~"(?i:($hostname))", mountpoint="/"} * 100
-      ) < 90
+      (avg by(agent_hostname)(
+        (node_memory_MemTotal_bytes{agent_hostname=~"$hostname"} 
+         - node_memory_MemAvailable_bytes{agent_hostname=~"$hostname"})
+        / node_memory_MemTotal_bytes{agent_hostname=~"$hostname"} * 100
+      )) < bool 90
+    )
+    and on(agent_hostname)
+    (
+      (avg by(agent_hostname)(
+        (node_filesystem_size_bytes{agent_hostname=~"$hostname", mountpoint="/"} 
+         - node_filesystem_free_bytes{agent_hostname=~"$hostname", mountpoint="/"})
+        / node_filesystem_size_bytes{agent_hostname=~"$hostname", mountpoint="/"} * 100
+      )) < bool 90
     )
   )
+  == bool true
 ) * 1
-
-
 
 
 
