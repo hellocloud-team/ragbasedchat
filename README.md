@@ -1,3 +1,23 @@
+
+
+(
+  (100 - avg by(instance)(rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100 < 90)
+)
+and on(instance)
+(
+  (node_memory_Active_bytes / node_memory_MemTotal_bytes * 100 < 90)
+)
+and on(instance)
+(
+  (node_filesystem_used_bytes / node_filesystem_size_bytes * 100 < 90)
+)
+* 1
+
+
+
+
+
+
 Chat with PDF using Langchain and Google Gemini
 
 Used: 
