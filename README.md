@@ -1,3 +1,11 @@
+
+
+count(count by(agent_hostname)(node_uname_info{agent_hostname=~"$hostname"}))
+
+
+
+
+
 count(
   (
     (
