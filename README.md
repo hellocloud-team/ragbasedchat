@@ -1,65 +1,89 @@
 
 
-count(count by(agent_hostname)(node_uname_info{agent_hostname=~"$hostname"}))
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Flat Animated Menu</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+  <ul class="menu">
+    <li><a href="#" class="active">Home</a></li>
+    <li><a href="#">Server</a></li>
+    <li><a href="#">Data</a></li>
+    <li><a href="#">Status</a></li>
+    <li><a href="#">Contact</a></li>
+  </ul>
+
+</body>
+</html>
 
 
+/* Reset some base styles */
+body {
+  margin: 0;
+  font-family: "Segoe UI", sans-serif;
+  background-color: #f4f4f4;
+}
 
+/* Menu container */
+.menu {
+  display: flex;
+  justify-content: center;
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  background-color: #2c3e50;
+}
 
+/* Menu items */
+.menu li {
+  margin: 0;
+}
 
-count(
-  (
-    (
-      (100 - avg by(agent_hostname)(
-        rate(node_cpu_seconds_total{agent_hostname=~"$hostname", mode="idle"}[5m])
-      ) * 100) < 90
-    )
-    and on(agent_hostname)
-    (
-      avg by(agent_hostname)(
-        (node_memory_MemTotal_bytes{agent_hostname=~"$hostname"}
-         - node_memory_MemAvailable_bytes{agent_hostname=~"$hostname"})
-        / node_memory_MemTotal_bytes{agent_hostname=~"$hostname"} * 100
-      ) < 90
-    )
-    and on(agent_hostname)
-    (
-      avg by(agent_hostname)(
-        (node_filesystem_size_bytes{agent_hostname=~"$hostname"}
-         - node_filesystem_free_bytes{agent_hostname=~"$hostname"})
-        / node_filesystem_size_bytes{agent_hostname=~"$hostname"} * 100
-      ) < 90
-    )
-  )
-)
+/* Menu links */
+.menu a {
+  display: block;
+  padding: 16px 30px;
+  color: #ecf0f1;
+  text-decoration: none;
+  position: relative;
+  transition: background-color 0.3s ease, color 0.3s ease;
+}
 
+/* Hover effect */
+.menu a:hover {
+  background-color: #34495e;
+  color: #ffffff;
+}
 
+/* Active menu style */
+.menu a.active {
+  background-color: #1abc9c;
+  color: #ffffff;
+}
+
+/* Optional: Smooth underline effect on hover */
+.menu a::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  bottom: 10px;
+  transform: translateX(-50%);
+  width: 0;
+  height: 2px;
+  background-color: #1abc9c;
+  transition: width 0.3s ease;
+}
+
+.menu a:hover::after {
+  width: 50%;
+}
 
 
 =≠=========
-
-count(
-  (
-    (100 - avg by(agent_hostname)(
-      rate(node_cpu_seconds_total{agent_hostname=~"$hostname", mode="idle"}[5m])
-    ) * 100) >= 90
-    or on(agent_hostname)
-    (
-      avg by(agent_hostname)(
-        (node_memory_MemTotal_bytes{agent_hostname=~"$hostname"}
-         - node_memory_MemAvailable_bytes{agent_hostname=~"$hostname"})
-        / node_memory_MemTotal_bytes{agent_hostname=~"$hostname"} * 100
-      ) >= 90
-    )
-    or on(agent_hostname)
-    (
-      avg by(agent_hostname)(
-        (node_filesystem_size_bytes{agent_hostname=~"$hostname"}
-         - node_filesystem_free_bytes{agent_hostname=~"$hostname"})
-        / node_filesystem_size_bytes{agent_hostname=~"$hostname"} * 100
-      ) >= 90
-    )
-  )
-)
 
 
 
