@@ -1,72 +1,57 @@
 
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>Flat Animated Menu</title>
+  <title>Flat Menu with Divs</title>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
 
-  <ul class="menu">
-    <li><a href="#" class="active">Home</a></li>
-    <li><a href="#">Server</a></li>
-    <li><a href="#">Data</a></li>
-    <li><a href="#">Status</a></li>
-    <li><a href="#">Contact</a></li>
-  </ul>
+  <div class="menu">
+    <div class="menu-item active">Home</div>
+    <div class="menu-item">Server</div>
+    <div class="menu-item">Data</div>
+    <div class="menu-item">Status</div>
+    <div class="menu-item">Contact</div>
+  </div>
 
 </body>
 </html>
 
 
-/* Reset some base styles */
-body {
+
+ body {
   margin: 0;
   font-family: "Segoe UI", sans-serif;
   background-color: #f4f4f4;
 }
 
-/* Menu container */
 .menu {
   display: flex;
   justify-content: center;
-  list-style: none;
-  padding: 0;
-  margin: 0;
   background-color: #2c3e50;
 }
 
-/* Menu items */
-.menu li {
-  margin: 0;
-}
-
-/* Menu links */
-.menu a {
-  display: block;
+.menu-item {
   padding: 16px 30px;
   color: #ecf0f1;
-  text-decoration: none;
+  cursor: pointer;
   position: relative;
   transition: background-color 0.3s ease, color 0.3s ease;
 }
 
-/* Hover effect */
-.menu a:hover {
+.menu-item:hover {
   background-color: #34495e;
   color: #ffffff;
 }
 
-/* Active menu style */
-.menu a.active {
+.menu-item.active {
   background-color: #1abc9c;
   color: #ffffff;
 }
 
-/* Optional: Smooth underline effect on hover */
-.menu a::after {
+.menu-item::after {
   content: "";
   position: absolute;
   left: 50%;
@@ -78,10 +63,9 @@ body {
   transition: width 0.3s ease;
 }
 
-.menu a:hover::after {
+.menu-item:hover::after {
   width: 50%;
 }
-
 
 =≠=========
 
