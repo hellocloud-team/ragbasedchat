@@ -1,74 +1,268 @@
 
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <title>Flat Menu with Divs</title>
-  <link rel="stylesheet" href="style.css">
-</head>
-<body>
+from langgraph.graph import StateGraph, END
+from langchain_openai import ChatOpenAI
+from langchain_community.utilities import SQLDatabase
+from sqlalchemy.exc import SQLAlchemyError
 
-  <div class="menu">
-    <div class="menu-item active">Home</div>
-    <div class="menu-item">Server</div>
-    <div class="menu-item">Data</div>
-    <div class="menu-item">Status</div>
-    <div class="menu-item">Contact</div>
-  </div>
+# ------------------------------------
+# 1. Setup LLM + Oracle DB
+# ------------------------------------
+llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 
-</body>
-</html>
+# Example Oracle URI:
+# "oracle+cx_oracle://username:password@hostname:1521/?service_name=ORCL"
+db = SQLDatabase.from_uri(
+    "oracle+cx_oracle://scott:tiger@localhost:1521/?service_name=ORCLCDB"
+)
+
+# ------------------------------------
+# 2. Define workflow functions
+# ------------------------------------
+def generate_sql(state):
+    """Generate SQL from natural language"""
+    schema = db.get_table_info()
+    question = state["question"]
+
+    prompt = f"""
+You are a SQL expert. 
+Database schema:
+{schema}
+
+User question: {question}
+
+Write a valid **Oracle SQL** query. Return ONLY the SQL.
+"""
+    sql = llm.invoke(prompt).content.strip()
+    return {"sql": sql}
+
+
+def run_sql(state):
+    """Execute SQL safely"""
+    sql = state["sql"]
+    try:
+        result = db.run(sql)
+        return {"result": result}
+    except SQLAlchemyError as e:
+        return {"result": f"SQL ERROR: {e}"}
+
+
+def summarize(state):
+    """Turn SQL result into a natural language answer"""
+    question = state["question"]
+    result = state["result"]
+
+    prompt = f"""
+Question: {question}
+SQL Result: {result}
+
+Answer the question in plain English.
+"""
+    answer = llm.invoke(prompt).content.strip()
+    return {"answer": answer}
+
+# ------------------------------------
+# 3. Build LangGraph
+# ------------------------------------
+graph = StateGraph(dict)
+
+graph.add_node("generate_sql", generate_sql)
+graph.add_node("run_sql", run_sql)
+graph.add_node("summarize", summarize)
+
+graph.add_edge("generate_sql", "run_sql")
+graph.add_edge("run_sql", "summarize")
+graph.add_edge("summarize", END)
+
+graph.set_entry_point("generate_sql")
+app = graph.compile()
+
+# ------------------------------------
+# 4. Run it
+# ------------------------------------
+result = app.invoke({"question": "Show me the top 5 highest paid employees"})
+print("Final Answer:", result["answer"])
 
 
 
- body {
-  margin: 0;
-  font-family: "Segoe UI", sans-serif;
-  background-color: #f4f4f4;
+from langchain.tools import Tool
+
+# Wrap LangGraph app as a function
+def text_to_sql_tool_func(question: str) -> str:
+    result = app.invoke({"question": question})
+    return result["answer"]
+
+# Create tool object
+text_to_sql_tool = Tool(
+    name="TextToSQL",
+    func=text_to_sql_tool_func,
+    description="Use this to answer questions about structured data in the Oracle database."
+)
+
+from langchain_openai import ChatOpenAI
+from langchain.agents import initialize_agent, AgentType
+
+llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+
+# Agent with your SQL tool
+agent = initialize_agent(
+    tools=[text_to_sql_tool],
+    llm=llm,
+    agent=AgentType.OPENAI_FUNCTIONS,  # function-calling style
+    verbose=True
+)
+
+# Ask a question
+response = agent.run("What is the average salary of employees in IT?")
+print("Agent Answer:", response)
+
+from langchain.tools import Tool
+
+# Wrap LangGraph app as a callable function
+def text_to_sql_tool_func(question: str) -> str:
+    """Call the LangGraph pipeline with a natural language question"""
+    result = app.invoke({"question": question})
+    return result["answer"]
+
+# Define the tool
+text_to_sql_tool = Tool(
+    name="TextToSQL",
+    func=text_to_sql_tool_func,
+    description="Answer questions about company data by converting natural language to Oracle SQL."
+)
+
+
+from langchain.agents import initialize_agent, AgentType
+
+# Initialize agent with tool
+agent = initialize_agent(
+    tools=[text_to_sql_tool],
+    llm=llm,
+    agent=AgentType.OPENAI_FUNCTIONS,
+    verbose=True
+)
+
+# Ask a question (agent decides when to use the tool)
+response = agent.run("What is the average salary of IT employees?")
+print("Agent Answer:", response)
+
+
+
+# Example DB map
+DB_CONNECTIONS = {
+    "hr_app": SQLDatabase.from_uri("sqlite:///hr.db"),
+    "finance_app": SQLDatabase.from_uri("sqlite:///finance.db"),
+    "sales_app": SQLDatabase.from_uri("oracle+cx_oracle://scott:tiger@localhost:1521/?service_name=ORCLCDB")
 }
 
-.menu {
-  display: flex;
-  justify-content: center;
-  background-color: #2c3e50;
+
+
+# Example DB map
+DB_CONNECTIONS = {
+    "hr_app": SQLDatabase.from_uri("sqlite:///hr.db"),
+    "finance_app": SQLDatabase.from_uri("sqlite:///finance.db"),
+    "sales_app": SQLDatabase.from_uri("oracle+cx_oracle://scott:tiger@localhost:1521/?service_name=ORCLCDB")
 }
 
-.menu-item {
-  padding: 16px 30px;
-  color: #ecf0f1;
-  cursor: pointer;
-  position: relative;
-  transition: background-color 0.3s ease, color 0.3s ease;
-}
 
-.menu-item:hover {
-  background-color: #34495e;
-  color: #ffffff;
-}
+def generate_sql(state):
+    """Generate SQL from natural language"""
+    app_name = state["app_name"]
+    db = DB_CONNECTIONS[app_name]
 
-.menu-item.active {
-  background-color: #1abc9c;
-  color: #ffffff;
-}
+    schema = db.get_table_info()
+    question = state["question"]
 
-.menu-item::after {
-  content: "";
-  position: absolute;
-  left: 50%;
-  bottom: 10px;
-  transform: translateX(-50%);
-  width: 0;
-  height: 2px;
-  background-color: #1abc9c;
-  transition: width 0.3s ease;
-}
+    prompt = f"""
+You are an SQL expert. 
+Database schema for app '{app_name}':
+{schema}
 
-.menu-item:hover::after {
-  width: 50%;
-}
+User question: {question}
 
-=≠=========
+Write a valid SQL query for this schema. Return ONLY the SQL.
+"""
+    sql = llm.invoke(prompt).content.strip()
+    return {"sql": sql}
 
+
+def run_sql(state):
+    """Execute SQL safely"""
+    app_name = state["app_name"]
+    db = DB_CONNECTIONS[app_name]
+
+    sql = state["sql"]
+    try:
+        result = db.run(sql)
+        return {"result": result}
+    except SQLAlchemyError as e:
+        return {"result": f"SQL ERROR: {e}"}
+
+
+
+        result = app.invoke({
+    "app_name": "hr_app",
+    "question": "Show me all employees hired after 2020"
+})
+print("Final Answer:", result["answer"])
+
+
+def generate_sql(state):
+    """Generate SQL just once (schema same across DBs)"""
+    # use schema from any DB (say hr_app)
+    schema = DB_CONNECTIONS["hr_app"].get_table_info()
+    question = state["question"]
+
+    prompt = f"""
+You are an SQL expert. 
+Database schema:
+{schema}
+
+User question: {question}
+
+Write a valid SQL query. Return ONLY the SQL.
+"""
+    sql = llm.invoke(prompt).content.strip()
+    return {"sql": sql}
+
+
+def run_sql(state):
+    """Run SQL against chosen DB"""
+    app_name = state["app_name"]
+    db = DB_CONNECTIONS[app_name]
+
+    sql = state["sql"]
+    try:
+        result = db.run(sql)
+        return {"result": result}
+    except SQLAlchemyError as e:
+        return {"result": f"SQL ERROR: {e}"}
+
+
+    def choose_db(state):
+    """Decide which app DB to query based on question"""
+    question = state["question"]
+
+    prompt = f"""
+You are a routing assistant. 
+We have 3 databases: hr_app, finance_app, sales_app.
+Decide which one is most relevant for this question.
+
+Question: {question}
+
+Return ONLY the app name (hr_app, finance_app, or sales_app).
+"""
+    app_name = llm.invoke(prompt).content.strip()
+    return {"app_name": app_name}
+
+
+   graph.add_node("choose_db", choose_db)
+graph.add_edge("choose_db", "generate_sql")
+graph.set_entry_point("choose_db")
+
+db = SQLDatabase.from_uri(
+    "sqlite:///hr.db",
+    include_tables=["employees", "departments"]  # ✅ only expose these
+)
 
 
 Chat with PDF using Langchain and Google Gemini
