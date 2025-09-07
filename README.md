@@ -4,7 +4,7 @@ from typing import Dict, Any
 from dotenv import load_dotenv
 
 from langgraph.graph import StateGraph, END
-from langchain_openai import ChatOpenAI
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_community.utilities import SQLDatabase
 from langchain.tools import Tool
 from langchain.agents import initialize_agent, AgentType
@@ -24,28 +24,37 @@ class AutosysOracleDatabase:
         """Initialize Oracle connection for Autosys database"""
         try:
             self.db = SQLDatabase.from_uri(connection_string)
-            self.llm = ChatOpenAI(
-                model="gpt-4o-mini", 
+            
+            # Initialize Gemini LLM
+            self.llm = ChatGoogleGenerativeAI(
+                model="gemini-1.5-pro",
                 temperature=0,
-                openai_api_key=os.getenv("OPENAI_API_KEY")
+                google_api_key=os.getenv("GOOGLE_API_KEY")  # Make sure this is set
             )
+            
+            # Initialize attributes first
+            self.available_tables = []
+            self.schema_info = {}
+            self.schema_cache = ""
             
             # Test connection
             test_result = self.db.run("SELECT 1 FROM dual")
             print("✅ Connected to Autosys Oracle database successfully")
             
             # Get Autosys schema information
-            self._discover_autosys_schema()
+            self.discover_autosys_schema()
             
         except Exception as e:
             print(f"❌ Database connection failed: {e}")
             print("Common fixes:")
             print("1. Install cx_Oracle: pip install cx_Oracle")
-            print("2. Check Oracle connection string format")
-            print("3. Verify Autosys database access permissions")
+            print("2. Install Google AI: pip install langchain-google-genai")
+            print("3. Set GOOGLE_API_KEY environment variable")
+            print("4. Check Oracle connection string format")
+            print("5. Verify Autosys database access permissions")
             raise
     
-    def _discover_autosys_schema(self):
+    def discover_autosys_schema(self):
         """Discover and cache Autosys table structure"""
         try:
             print("\n🔍 Discovering Autosys database schema...")
@@ -56,9 +65,6 @@ class AutosysOracleDatabase:
                 'CALENDAR', 'MACHINE', 'GLOBAL_VARIABLES',
                 'BOX_JOB', 'CMD_JOB', 'FILE_WATCHER_JOB'
             ]
-            
-            self.available_tables = []
-            self.schema_info = {}
             
             for table in autosys_tables:
                 try:
@@ -94,111 +100,171 @@ class AutosysOracleDatabase:
             self.available_tables = []
             self.schema_cache = ""
 
-# Initialize database connection
+# Initialize database connection with better error handling
 # Update with your actual Autosys Oracle connection details
 ORACLE_CONNECTION = "oracle+cx_oracle://username:password@hostname:1521/?service_name=ORCL"
-autosys_db = AutosysOracleDatabase(ORACLE_CONNECTION)
+
+# Global variables to handle initialization
+autosys_db = None
+initialization_error = None
+
+try:
+    print("🔄 Initializing Autosys Oracle connection...")
+    autosys_db = AutosysOracleDatabase(ORACLE_CONNECTION)
+except Exception as e:
+    initialization_error = str(e)
+    print(f"⚠️  Database initialization failed: {e}")
+    print("The tool will work in limited mode. Update ORACLE_CONNECTION and restart.")
+    
+    # Create a mock database object for testing
+    class MockAutosysDB:
+        def __init__(self):
+            self.available_tables = ['JOB', 'JOB_STATUS', 'CALENDAR']
+            self.schema_cache = "Mock schema - update connection string"
+            self.llm = ChatGoogleGenerativeAI(
+                model="gemini-1.5-pro",
+                temperature=0,
+                google_api_key=os.getenv("GOOGLE_API_KEY")
+            )
+    
+    autosys_db = MockAutosysDB()
 
 # ------------------------------------
 # 2. Autosys-Specific SQL Generation
 # ------------------------------------
 def generate_autosys_sql(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Generate SQL specifically for Autosys database queries"""
+    """Generate SQL specifically for Autosys database queries using Gemini"""
     try:
-        question = state["question"]
-        schema = autosys_db.schema_cache
-        available_tables = autosys_db.available_tables
+        question = state.get("question", "")
+        if not question:
+            return {"sql": "", "error": "No question provided", "question": ""}
+            
+        schema = getattr(autosys_db, 'schema_cache', '')
+        available_tables = getattr(autosys_db, 'available_tables', [])
         
-        # Enhanced prompt for Autosys-specific queries
-        prompt = f"""
-You are an expert in Autosys job scheduling system and Oracle SQL.
+        # Gemini works well with structured, clear prompts
+        prompt = f"""You are an Oracle SQL expert for Autosys job scheduling database.
 
-AUTOSYS DATABASE CONTEXT:
+TASK: Generate Oracle SQL query for the user question.
+
+CONTEXT:
+- Database: Autosys job scheduling system on Oracle
 - Available tables: {available_tables}
-- This is an Autosys application database for job scheduling
-- Common queries involve job status, schedules, dependencies, calendars
-
-DATABASE SCHEMA:
-{schema}
+- Schema info: {schema[:800] if schema else 'Schema not available'}
 
 USER QUESTION: {question}
 
-AUTOSYS QUERY PATTERNS:
-1. Job Status: SELECT job_name, status, last_start, last_end FROM JOB WHERE job_name LIKE '%job1%'
-2. Job Details: SELECT job_name, job_type, command, machine FROM JOB WHERE job_name = 'JOB1'
-3. Job Runs History: SELECT job_name, start_time, end_time, status FROM JOB_RUNS WHERE job_name = 'JOB1' ORDER BY start_time DESC
-4. Dependencies: SELECT job_name, condition FROM JOB_DEPENDENCY WHERE job_name = 'JOB1'
-5. Calendar Info: SELECT calendar_name, date_stamp, run_flag FROM CALENDAR WHERE calendar_name = 'CAL1'
-6. Box Jobs: SELECT job_name, box_name FROM BOX_JOB WHERE box_name LIKE '%BOX1%'
+RULES:
+1. Use Oracle SQL syntax only
+2. Use ROWNUM instead of LIMIT
+3. For job status queries, use JOB table
+4. For partial job names, use LIKE with wildcards (%)
+5. Common columns: job_name, status, last_start, last_end
+6. Return ONLY the SQL query - no explanations
 
-ORACLE SQL REQUIREMENTS:
-- Use Oracle syntax (ROWNUM instead of LIMIT)
-- Use proper date functions (SYSDATE, TO_DATE, etc.)
-- Handle NULL values with NVL or NVL2
-- Use proper case for Autosys table/column names
-- For "top N" queries: WHERE ROWNUM <= N
-- Use wildcards (%) for partial job name matches
+EXAMPLES:
+- Job status: SELECT job_name, status FROM JOB WHERE job_name LIKE '%job1%'
+- Recent runs: SELECT * FROM (SELECT job_name, status, last_start FROM JOB ORDER BY last_start DESC) WHERE ROWNUM <= 5
 
-COMMON AUTOSYS COLUMNS:
-- job_name: Job identifier
-- status: Current job status (SU=Success, FA=Failure, RU=Running, etc.)
-- last_start, last_end: Execution timestamps
-- job_type: BOX, CMD, FW (File Watcher), etc.
-- machine: Target machine for execution
-- command: Command/script to execute
-
-Return ONLY the Oracle SQL query:
-"""
+SQL Query:"""
         
-        response = autosys_db.llm.invoke(prompt)
-        sql = response.content.strip()
+        try:
+            response = autosys_db.llm.invoke(prompt)
+            # Gemini response handling
+            sql_content = response.content if hasattr(response, 'content') else str(response)
+        except Exception as llm_error:
+            print(f"❌ Gemini LLM call failed: {llm_error}")
+            # Create a basic fallback query
+            job_hint = ""
+            for word in question.lower().split():
+                if 'job' in word or word.isalnum():
+                    job_hint = word.replace('job', '')
+                    break
+            sql_content = f"SELECT job_name, status, last_start, last_end FROM JOB WHERE job_name LIKE '%{job_hint}%' AND ROWNUM <= 10"
         
-        # Clean up formatting
-        sql = sql.replace("```sql", "").replace("```", "").strip()
+        # Clean SQL output - Gemini sometimes adds formatting
+        sql = sql_content.strip()
+        
+        # Remove common formatting that Gemini might add
+        cleanups = ["```sql", "```oracle", "```", "sql:", "query:", "SQL:", "Query:"]
+        for cleanup in cleanups:
+            sql = sql.replace(cleanup, "")
+        
+        sql = sql.strip()
+        
+        # Remove trailing semicolon for SQLAlchemy
         if sql.endswith(';'):
             sql = sql[:-1]
+            
+        # Validate basic SQL structure
+        if not sql or len(sql.strip()) < 10 or not any(keyword in sql.upper() for keyword in ['SELECT', 'FROM']):
+            print("⚠️ Generated SQL seems invalid, using fallback")
+            sql = "SELECT job_name, status FROM JOB WHERE ROWNUM <= 10"
         
-        print(f"🔍 Generated Autosys SQL: {sql}")
-        return {"sql": sql, "question": question}
+        print(f"🔍 Gemini generated SQL: {sql}")
+        
+        return {
+            "sql": sql,
+            "question": question,
+            "error": None
+        }
         
     except Exception as e:
-        print(f"❌ Error generating Autosys SQL: {e}")
-        return {"sql": "", "error": str(e), "question": state["question"]}
+        error_msg = f"SQL generation error: {str(e)}"
+        print(f"❌ {error_msg}")
+        return {
+            "sql": "",
+            "error": error_msg,
+            "question": state.get("question", "")
+        }
 
 def execute_autosys_sql(state: Dict[str, Any]) -> Dict[str, Any]:
     """Execute SQL against Autosys Oracle database"""
-    sql = state["sql"]
-    question = state["question"]
-    
-    if not sql or state.get("error"):
-        return {**state, "result": "Failed to generate valid SQL for Autosys query"}
-    
     try:
-        print(f"⚡ Executing Autosys query: {sql}")
-        result = autosys_db.db.run(sql)
+        sql = state.get("sql", "")
+        question = state.get("question", "")
+        error = state.get("error")
         
-        if not result or str(result).strip() == "":
-            result = "No Autosys data found for the specified criteria"
+        if error or not sql:
+            return {
+                **state,
+                "result": f"Cannot execute query: {error or 'No SQL generated'}",
+                "needs_retry": False
+            }
         
-        print(f"📊 Autosys query result: {result}")
-        return {**state, "result": str(result)}
+        print(f"⚡ Executing: {sql}")
         
-    except SQLAlchemyError as e:
-        error_msg = f"Oracle/Autosys query error: {str(e)}"
-        print(f"❌ {error_msg}")
-        
-        # Try to fix common Autosys query issues
-        if "invalid identifier" in str(e).lower():
-            error_msg += " (Check table/column names - Autosys tables may be case-sensitive)"
-        elif "table or view does not exist" in str(e).lower():
-            error_msg += f" (Available tables: {autosys_db.available_tables})"
-        
-        return {**state, "result": error_msg, "needs_retry": True}
+        try:
+            result = autosys_db.db.run(sql)
+            if not result or str(result).strip() == "":
+                result = "No data found"
+            
+            print(f"📊 Result: {result}")
+            return {
+                **state,
+                "result": str(result),
+                "needs_retry": False
+            }
+            
+        except Exception as db_error:
+            error_msg = f"Database error: {str(db_error)}"
+            print(f"❌ {error_msg}")
+            
+            return {
+                **state,
+                "result": error_msg,
+                "needs_retry": True,
+                "retry_attempted": False
+            }
         
     except Exception as e:
-        error_msg = f"Unexpected error: {str(e)}"
+        error_msg = f"Execution error: {str(e)}"
         print(f"❌ {error_msg}")
-        return {**state, "result": error_msg}
+        return {
+            **state,
+            "result": error_msg,
+            "needs_retry": False
+        }
 
 def fix_autosys_sql_error(state: Dict[str, Any]) -> Dict[str, Any]:
     """Attempt to fix common Autosys SQL errors"""
@@ -245,45 +311,73 @@ Fix the query for Autosys Oracle database. Return ONLY the corrected SQL:
         return {**state, "result": f"Error in SQL fix attempt: {str(e)}"}
 
 def summarize_autosys_result(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Summarize Autosys query results in business terms"""
+    """Summarize Autosys query results using Gemini"""
     try:
-        question = state["question"]
-        result = state["result"]
+        question = state.get("question", "")
+        result = state.get("result", "")
         sql = state.get("sql", "")
         
-        if "error" in result.lower() or "failed" in result.lower():
-            return {**state, "answer": f"Unable to retrieve Autosys data: {result}"}
+        if not result or "error" in result.lower():
+            return {
+                **state, 
+                "answer": f"Unable to retrieve data: {result}"
+            }
         
-        prompt = f"""
-You are an Autosys expert explaining query results to business users.
+        # Handle no data case
+        if "no data found" in result.lower():
+            answer = f"No Autosys jobs found matching your query: '{question}'"
+        else:
+            # Try Gemini summarization with simple prompt
+            try:
+                # Gemini-optimized prompt - more conversational
+                prompt = f"""Help explain this Autosys database query result to a user.
 
-Original Question: {question}
-Autosys Data Retrieved: {result}
+User asked: "{question}"
+Database returned: {result}
 
-AUTOSYS CONTEXT:
-- Job statuses: SU=Success, FA=Failure, RU=Running, TE=Terminated, etc.
-- Job types: BOX=Container job, CMD=Command job, FW=File Watcher
-- This is job scheduling and workflow automation data
+Context: This is from an Autosys job scheduling system where:
+- Jobs have statuses like SU (Success), FA (Failure), RU (Running)
+- job_name identifies the scheduled job
+- Timestamps show when jobs ran
 
-Provide a clear, business-friendly explanation of the Autosys data.
-Include relevant context about job scheduling, status meanings, etc.
-Format timestamps and status codes in readable terms.
+Please give a clear, helpful answer in plain English. Be concise but informative.
 
-Business-friendly answer:
-"""
+Answer:"""
+                
+                response = autosys_db.llm.invoke(prompt)
+                gemini_answer = response.content if hasattr(response, 'content') else str(response)
+                
+                if gemini_answer and len(gemini_answer.strip()) > 10:
+                    answer = gemini_answer.strip()
+                else:
+                    # Fallback to basic formatting
+                    answer = f"Found the following Autosys data for '{question}':\n{result}"
+                    
+            except Exception as llm_error:
+                print(f"⚠️ Gemini summarization failed: {llm_error}")
+                # Basic fallback without LLM
+                answer = f"Here's what I found for '{question}':\n{result}"
         
-        response = autosys_db.llm.invoke(prompt)
-        answer = response.content.strip()
-        
-        print(f"✅ Autosys answer: {answer}")
-        return {**state, "answer": answer}
+        print(f"✅ Final answer: {answer}")
+        return {
+            **state,
+            "answer": answer
+        }
         
     except Exception as e:
-        return {**state, "answer": f"Error summarizing Autosys data: {str(e)}"}
+        error_msg = f"Summarization error: {str(e)}"
+        print(f"❌ {error_msg}")
+        return {
+            **state,
+            "answer": f"Retrieved data but couldn't format it: {state.get('result', '')}"
+        }
 
 def should_retry_autosys_query(state: Dict[str, Any]) -> str:
     """Decide whether to retry failed Autosys queries"""
-    if state.get("needs_retry") and not state.get("retry_attempted"):
+    needs_retry = state.get("needs_retry", False)
+    retry_attempted = state.get("retry_attempted", False)
+    
+    if needs_retry and not retry_attempted:
         return "fix_sql_error"
     else:
         return "summarize"
@@ -321,20 +415,48 @@ autosys_app = autosys_workflow.compile()
 def autosys_tool_func(question: str) -> str:
     """Query Autosys database for job scheduling information"""
     try:
-        if not question or question.strip() == "":
+        if not question or not question.strip():
             return "Please provide a question about Autosys jobs, calendars, or schedules."
         
-        print(f"\n🚀 Processing Autosys query: '{question}'")
-        print("=" * 60)
+        question = question.strip()
+        print(f"\n🚀 Processing: '{question}'")
         
-        result = autosys_app.invoke({"question": question.strip()})
-        answer = result.get("answer", "No answer generated for Autosys query")
+        # Initialize state with proper structure
+        initial_state = {
+            "question": question,
+            "sql": "",
+            "result": "",
+            "answer": "",
+            "error": None,
+            "needs_retry": False,
+            "retry_attempted": False
+        }
         
-        print(f"🎯 Autosys response: {answer}")
-        return answer
+        try:
+            # Run the workflow
+            result = autosys_app.invoke(initial_state)
+            
+            # Extract answer with fallbacks
+            if isinstance(result, dict):
+                answer = result.get("answer", "")
+                if not answer:
+                    answer = result.get("result", "No response generated")
+            else:
+                answer = str(result)
+            
+            if not answer or answer.strip() == "":
+                answer = "No answer could be generated for your query."
+            
+            print(f"🎯 Response: {answer}")
+            return answer
+            
+        except Exception as workflow_error:
+            error_msg = f"Workflow execution failed: {str(workflow_error)}"
+            print(f"❌ {error_msg}")
+            return f"Sorry, I couldn't process your query: {error_msg}"
         
     except Exception as e:
-        error_msg = f"Autosys tool error: {str(e)}"
+        error_msg = f"Tool error: {str(e)}"
         print(f"❌ {error_msg}")
         return error_msg
 
@@ -404,7 +526,7 @@ def create_autosys_agent():
         
         agent = initialize_agent(
             tools=[autosys_sql_tool],
-            llm=ChatOpenAI(model="gpt-4o-mini", temperature=0),
+            llm=ChatGoogleGenerativeAI(model="gemini-1.5-pro", temperature=0),
             agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
             verbose=True
         )
@@ -429,12 +551,21 @@ def create_autosys_agent():
         print(f"❌ Agent creation failed: {e}")
 
 if __name__ == "__main__":
-    print("🚀 Autosys Oracle Database Query Tool")
-    print("=" * 60)
+    print("🚀 Autosys Oracle Database Query Tool (Powered by Gemini)")
+    print("=" * 70)
     
-    # Update connection string before running
-    print("⚠️  IMPORTANT: Update ORACLE_CONNECTION with your Autosys database details")
-    print("Format: oracle+cx_oracle://user:pass@host:port/?service_name=SERVICE")
+    # Setup instructions
+    print("📋 SETUP REQUIREMENTS:")
+    print("1. Install packages: pip install langchain-google-genai cx_Oracle")
+    print("2. Set environment variable: GOOGLE_API_KEY=your_gemini_api_key")
+    print("3. Update ORACLE_CONNECTION with your Autosys database details")
+    print("   Format: oracle+cx_oracle://user:pass@host:port/?service_name=SERVICE")
+    print()
+    
+    if initialization_error:
+        print(f"⚠️  Database not connected: {initialization_error}")
+        print("Tool running in mock mode - update connection to use with real data")
+        print()
     
     try:
         # Test Autosys queries
@@ -446,6 +577,11 @@ if __name__ == "__main__":
         print("\n✅ Autosys tool ready!")
         print("Usage: autosys_sql_tool.run('What is the status of my_job?')")
         
+        # Quick test
+        print("\n🧪 Quick Test:")
+        test_result = autosys_sql_tool.run("Show me job status information")
+        print(f"Test result: {test_result}")
+        
     except Exception as e:
         print(f"❌ Setup failed: {e}")
-        print("Check your Oracle connection and Autosys database access")
+        print("Make sure GOOGLE_API_KEY is set and try again")
