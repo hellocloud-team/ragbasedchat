@@ -1,5 +1,212 @@
 
 import os
+from typing import Dict, Any, List
+from sqlalchemy import create_engine, text
+from sqlalchemy.exc import SQLAlchemyError
+import oracledb
+
+# ------------------------------------
+# AutosysOracleDatabase Class
+# ------------------------------------
+class AutosysOracleDatabase:
+    """Specialized class for Autosys Oracle database operations using oracledb"""
+    
+    def __init__(self, connection_string: str):
+        """Initialize Oracle connection for Autosys database"""
+        try:
+            self.engine = create_engine(connection_string)
+            with self.engine.connect() as conn:
+                result = conn.execute(text("SELECT 1 FROM dual"))
+                print("✅ Connected to Autosys Oracle database successfully")
+            
+            self.available_tables = []
+            self.schema_info = {}
+            self.schema_cache = ""
+            
+            self.discover_autosys_schema()
+            
+        except SQLAlchemyError as e:
+            print(f"❌ Database connection failed: {e}")
+            print("Common fixes:")
+            print("1. Install oracledb: pip install oracledb")
+            print("2. Check Oracle connection string format")
+            print("3. Verify Autosys database access permissions")
+            raise
+    
+    def discover_autosys_schema(self):
+        """Safely discover Autosys schema using direct engine connection"""
+        try:
+            print("\n🔍 Discovering Autosys database schema...")
+            
+            # Common Autosys tables to check
+            autosys_tables = [
+                'JOB', 'JOB_STATUS', 'JOB_RUNS', 'JOB_DEPENDENCY',
+                'CALENDAR', 'MACHINE', 'GLOBAL_VARIABLES',
+                'BOX_JOB', 'CMD_JOB', 'FILE_WATCHER_JOB'
+            ]
+            
+            with self.engine.connect() as conn:
+                for table in autosys_tables:
+                    try:
+                        # Check if table exists by querying
+                        conn.execute(text(f"SELECT COUNT(*) FROM {table} WHERE ROWNUM = 1"))
+                        self.available_tables.append(table)
+                        print(f"✅ Found table: {table}")
+                    except Exception:
+                        print(f"⚠️  Table not found or no access: {table}")
+            
+            if not self.available_tables:
+                print("⚠️  No standard Autosys tables found. Discovering all accessible tables...")
+                try:
+                    with self.engine.connect() as conn:
+                        tables_query = text("""
+                            SELECT table_name FROM user_tables 
+                            WHERE table_name LIKE '%JOB%' 
+                            OR table_name LIKE '%CALENDAR%'
+                            OR table_name LIKE '%SCHEDULE%'
+                            ORDER BY table_name
+                        """)
+                        result = conn.execute(tables_query)
+                        tables_result = [row[0] for row in result.fetchall()]
+                        self.available_tables = tables_result
+                        print(f"Available job-related tables: {tables_result}")
+                except Exception as e:
+                    print(f"Could not discover tables: {e}")
+            
+            # Build schema information
+            self._build_schema_info()
+            print(f"\n📊 Available Autosys tables: {self.available_tables}")
+            
+        except Exception as e:
+            print(f"❌ Schema discovery failed: {e}")
+            self.available_tables = ['JOB', 'JOB_STATUS']
+            self.schema_cache = "Schema discovery failed - using basic table structure"
+    
+    def _build_schema_info(self):
+        """Build comprehensive schema information"""
+        try:
+            schema_parts = []
+            schema_parts.append(f"Available Tables: {', '.join(self.available_tables)}")
+            
+            # Get column info for key tables
+            key_tables = ['JOB', 'JOB_STATUS', 'JOB_RUNS']
+            
+            with self.engine.connect() as conn:
+                for table in key_tables:
+                    if table in self.available_tables:
+                        try:
+                            col_query = text(f"""
+                                SELECT column_name, data_type 
+                                FROM user_tab_columns 
+                                WHERE table_name = '{table}' 
+                                ORDER BY column_id
+                            """)
+                            result = conn.execute(col_query)
+                            columns = [(row[0], row[1]) for row in result.fetchall()]
+                            
+                            if columns:
+                                col_info = f"{table}: " + ", ".join([f"{col}({dtype})" for col, dtype in columns[:10]])
+                                schema_parts.append(col_info)
+                                
+                        except Exception as col_error:
+                            print(f"⚠️ Could not get columns for {table}: {col_error}")
+            
+            self.schema_cache = "\n".join(schema_parts)
+            
+        except Exception as e:
+            print(f"⚠️ Schema info building failed: {e}")
+            self.schema_cache = f"Available tables: {', '.join(self.available_tables)}"
+    
+    def execute_query(self, sql: str) -> str:
+        """Execute SQL query using direct engine connection"""
+        try:
+            with self.engine.connect() as conn:
+                result = conn.execute(text(sql))
+                rows = result.fetchall()
+                
+                if not rows:
+                    return "No data found"
+                
+                # Format results as CSV-like string
+                formatted_rows = []
+                for row in rows:
+                    formatted_rows.append(",".join([str(col) if col is not None else 'NULL' for col in row]))
+                
+                return "\n".join(formatted_rows)
+                
+        except Exception as e:
+            print(f"❌ Query execution failed: {e}")
+            return f"Query execution error: {str(e)}"
+    
+    def get_table_info(self) -> str:
+        """Get table information for SQL generation"""
+        return self.schema_cache
+    
+    def get_usable_table_names(self) -> List[str]:
+        """Get list of available table names"""
+        return self.available_tables
+    
+    def run(self, sql: str) -> str:
+        """Execute SQL query (alias for execute_query)"""
+        return self.execute_query(sql)
+    
+    def close(self):
+        """Close database connection"""
+        try:
+            if hasattr(self, 'engine') and self.engine:
+                self.engine.dispose()
+                print("✅ Database connection closed")
+        except Exception as e:
+            print(f"⚠️ Error closing connection: {e}")
+
+# ------------------------------------
+# Usage Example
+# ------------------------------------
+"""
+# How to use AutosysOracleDatabase:
+
+# 1. Initialize with your connection string
+connection_string = "oracle+oracledb://user:password@hostname:1521/?service_name=AUTOSYS"
+autosys_db = AutosysOracleDatabase(connection_string)
+
+# 2. Execute queries directly
+result = autosys_db.execute_query("SELECT job_name, status FROM JOB WHERE ROWNUM <= 5")
+print(result)
+
+# 3. Get schema information
+schema_info = autosys_db.get_table_info()
+print(schema_info)
+
+# 4. Get available tables
+tables = autosys_db.get_usable_table_names()
+print(tables)
+
+# 5. Use run method (alias for execute_query)
+result = autosys_db.run("SELECT COUNT(*) FROM JOB")
+print(result)
+
+# 6. Close connection when done
+autosys_db.close()
+"""
+
+if __name__ == "__main__":
+    print("🚀 AutosysOracleDatabase Class")
+    print("=" * 40)
+    print("Usage:")
+    print("1. Set connection string: oracle+oracledb://user:pass@host:port/?service_name=SERVICE")
+    print("2. Initialize: autosys_db = AutosysOracleDatabase(connection_string)")
+    print("3. Execute queries: result = autosys_db.execute_query(sql)")
+    print("4. Get schema info: schema = autosys_db.get_table_info()")
+
+
+
+
+
+
+
+
+
+import os
 from typing import Dict, Any
 from dotenv import load_dotenv
 
