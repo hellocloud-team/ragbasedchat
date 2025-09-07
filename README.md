@@ -1,5 +1,5 @@
 
-        import os
+import os
 from typing import Dict, Any
 from dotenv import load_dotenv
 
@@ -8,14 +8,15 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_community.utilities import SQLDatabase
 from langchain.tools import Tool
 from sqlalchemy.exc import SQLAlchemyError
+import oracledb
 
 load_dotenv()
 
 # ------------------------------------
-# 1. Fixed Autosys Database Class
+# 1. Autosys Oracle Database Class  
 # ------------------------------------
-class FixedAutosysDatabase:
-    """Fixed version that handles connection issues properly"""
+class AutosysOracleDatabase:
+    """Autosys Oracle Database class using oracledb driver"""
     
     def __init__(self, connection_string: str):
         self.connection_string = connection_string
@@ -40,7 +41,7 @@ class FixedAutosysDatabase:
                     # Test connection
                     test_result = self.db.run("SELECT 1 FROM dual")
                     self.connected = True
-                    print("✅ Oracle database connected")
+                    print("✅ Oracle database connected using oracledb driver")
                     self._discover_schema()
                 except Exception as db_error:
                     print(f"⚠️ Database connection failed: {db_error}")
@@ -54,10 +55,10 @@ class FixedAutosysDatabase:
             self._setup_mock_mode()
     
     def _is_valid_connection_string(self, conn_str: str) -> bool:
-        """Check if connection string is properly configured"""
+        """Check if connection string is properly configured for oracledb"""
         return (conn_str and 
                 "username:password" not in conn_str and 
-                "oracle+cx_oracle://" in conn_str)
+                ("oracle+oracledb://" in conn_str or "oracle://" in conn_str))
     
     def _setup_mock_mode(self):
         """Setup mock database for testing"""
@@ -77,6 +78,7 @@ class FixedAutosysDatabase:
         - BOX_JOB: Box job hierarchies
         """
         print("🔧 Running in mock mode - update connection string for real data")
+        print("💡 Expected format: oracle+oracledb://user:pass@host:port/?service_name=SERVICE")
     
     def _discover_schema(self):
         """Safely discover Autosys schema"""
@@ -112,9 +114,9 @@ class FixedAutosysDatabase:
             self.available_tables = ['JOB', 'JOB_STATUS']
             self.schema_info = "Schema discovery failed - using basic table structure"
 
-# Initialize the fixed database
-ORACLE_CONNECTION = os.getenv("ORACLE_CONNECTION", "oracle+cx_oracle://username:password@hostname:1521/?service_name=ORCL")
-autosys_db = FixedAutosysDatabase(ORACLE_CONNECTION)
+# Initialize the Autosys Oracle database
+ORACLE_CONNECTION = os.getenv("ORACLE_CONNECTION", "oracle+oracledb://username:password@hostname:1521/?service_name=ORCL")
+autosys_db = AutosysOracleDatabase(ORACLE_CONNECTION)
 
 # ------------------------------------
 # 2. Fixed SQL Generation (No More slice() Error)
@@ -418,18 +420,25 @@ def test_fixed_tool():
             print(f"❌ Error: {e}")
 
 if __name__ == "__main__":
-    print("🚀 Fixed Autosys Tool - No More Slice/Connection Errors")
+    print("🚀 Autosys Oracle Database Tool - Using oracledb Driver")
     print("=" * 60)
     
     print("📋 Setup Instructions:")
-    print("1. Set GOOGLE_API_KEY environment variable")
-    print("2. Set ORACLE_CONNECTION environment variable with your DB details")
-    print("3. Replace your existing AutosysQuery tool with autosys_sql_tool_fixed")
+    print("1. Install packages: pip install oracledb langchain-google-genai")
+    print("2. Set GOOGLE_API_KEY environment variable")
+    print("3. Set ORACLE_CONNECTION environment variable:")
+    print("   Format: oracle+oracledb://user:pass@host:port/?service_name=SERVICE")
+    print("   Example: oracle+oracledb://autosys_user:password@db.company.com:1521/?service_name=AUTOSYS")
+    print("4. Replace your existing AutosysQuery tool with autosys_sql_tool_fixed")
+    print()
+    print("💡 Note: Using oracledb driver (newer than cx_Oracle)")
+    
+    # Show connection status
+    print(f"\n🔍 Current Status:")
+    print(f"Database Connected: {autosys_db.connected}")
+    print(f"Connection String: {ORACLE_CONNECTION[:50]}...")
+    print(f"Available Tables: {autosys_db.available_tables}")
+    print(f"LLM Ready: {autosys_db.llm is not None}")
     
     # Test the tool
     test_fixed_tool()
-    
-    print(f"\n✅ Tool Status:")
-    print(f"Database Connected: {autosys_db.connected}")
-    print(f"Available Tables: {autosys_db.available_tables}")
-    print(f"LLM Ready: {autosys_db.llm is not None}")
