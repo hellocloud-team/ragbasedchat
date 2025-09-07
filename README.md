@@ -460,30 +460,31 @@ def autosys_tool_func(question: str) -> str:
         print(f"❌ {error_msg}")
         return error_msg
 
-# Create the Autosys-specific tool
+# Create the Autosys-specific tool with improved description
 autosys_sql_tool = Tool(
     name="AutosysQuery",
     func=autosys_tool_func,
     description="""
-    Query the Autosys job scheduling database for information about:
+    Use this tool to get information from the Autosys job scheduling database.
     
-    - Job status and execution history
-    - Job schedules and dependencies  
-    - Calendar definitions and dates
-    - Box jobs and workflows
-    - Machine assignments
-    - Error conditions and alerts
+    This tool handles all database connectivity and SQL execution internally.
+    Do NOT try to execute SQL queries directly.
     
-    Example queries:
+    Input: A natural language question about Autosys jobs, schedules, or status
+    Output: A formatted answer with the requested information
+    
+    Example inputs:
     - "What is the status of job1?"
-    - "Show me the last 5 runs of BATCH_LOAD_JOB"
-    - "Which jobs depend on JOB_EXTRACT?"
-    - "What jobs are scheduled to run today?"
-    - "Show me all failed jobs from yesterday"
-    - "What is the schedule for calendar MONTH_END?"
+    - "Show me failed jobs from yesterday"
+    - "List all jobs in the DAILY_BATCH box"
+    - "What jobs depend on DATA_EXTRACT_JOB?"
     
-    Input: Natural language question about Autosys jobs/schedules
-    Output: Business-friendly explanation of job scheduling data
+    The tool will automatically:
+    1. Generate the appropriate Oracle SQL query
+    2. Execute it against the Autosys database
+    3. Format the results in a readable way
+    
+    Always use this tool for any Autosys database questions.
     """
 )
 
@@ -520,35 +521,95 @@ def test_autosys_queries():
 # 6. Integration Example
 # ------------------------------------
 def create_autosys_agent():
-    """Example of using Autosys tool with an agent"""
+    """Example of using Autosys tool with an agent - with better configuration"""
     try:
         print("\n🤖 Creating Autosys-enabled Agent...")
         
+        # Use a more restrictive agent type to avoid SQL execution attempts
         agent = initialize_agent(
             tools=[autosys_sql_tool],
-            llm=ChatGoogleGenerativeAI(model="gemini-1.5-pro", temperature=0),
+            llm=ChatGoogleGenerativeAI(
+                model="gemini-1.5-pro", 
+                temperature=0,
+                # Add system instruction to prevent direct SQL execution
+                system_instruction="You are an Autosys expert assistant. Always use the AutosysQuery tool for database questions. Never attempt to execute SQL queries directly."
+            ),
             agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
-            verbose=True
+            verbose=True,
+            handle_parsing_errors=True,  # This helps with parsing issues
+            max_iterations=3,  # Limit iterations to prevent loops
+            early_stopping_method="generate"
         )
         
-        # Test complex Autosys analysis
-        complex_queries = [
-            "Can you analyze the health of our batch processing jobs?",
-            "What jobs should I investigate for performance issues?",
-            "Help me understand the dependencies for our daily data pipeline"
+        # Test with simpler, more direct queries first
+        simple_queries = [
+            "Use the AutosysQuery tool to check the status of job1",
+            "What is the current status of any job named job1?",
         ]
         
-        for query in complex_queries:
-            print(f"\n🔍 Complex Analysis: {query}")
+        for query in simple_queries:
+            print(f"\n🔍 Testing: {query}")
             try:
                 response = agent.run(query)
-                print(f"📊 Analysis: {response}")
+                print(f"📊 Response: {response}")
+                break  # Success, no need to try more
             except Exception as e:
                 print(f"❌ Error: {e}")
-            print("-" * 50)
+                continue
                 
     except Exception as e:
         print(f"❌ Agent creation failed: {e}")
+
+
+# ------------------------------------
+# 6. Direct Tool Usage (Recommended)
+# ------------------------------------
+def test_direct_tool_usage():
+    """Test the tool directly without agent - more reliable"""
+    print("\n🧪 Testing Direct Tool Usage (Recommended)")
+    print("=" * 60)
+    
+    test_queries = [
+        "What is the status of job1?",
+        "Show me all job statuses",
+        "List jobs that failed recently",
+        "What jobs are currently running?",
+        "Show me job information for any job with 'batch' in the name"
+    ]
+    
+    for i, query in enumerate(test_queries, 1):
+        print(f"\n{i}. Direct Query: {query}")
+        print("-" * 50)
+        try:
+            # Call the tool directly - this avoids agent parsing issues
+            result = autosys_sql_tool.run(query)
+            print(f"✅ Result: {result}")
+        except Exception as e:
+            print(f"❌ Error: {e}")
+        print()
+
+# ------------------------------------
+# 7. Alternative Simple Agent
+# ------------------------------------
+def create_simple_autosys_interface():
+    """Create a simple interface that avoids complex agent behavior"""
+    
+    def simple_autosys_chat(question: str) -> str:
+        """Simple chat interface that always uses the tool correctly"""
+        try:
+            print(f"🔍 Processing: {question}")
+            
+            # Always route through our tool
+            result = autosys_sql_tool.run(question)
+            return result
+            
+        except Exception as e:
+            return f"Error processing your question: {str(e)}"
+    
+    return simple_autosys_chat
+
+# Create the simple interface
+simple_autosys_chat = create_simple_autosys_interface()
 
 if __name__ == "__main__":
     print("🚀 Autosys Oracle Database Query Tool (Powered by Gemini)")
@@ -568,19 +629,31 @@ if __name__ == "__main__":
         print()
     
     try:
-        # Test Autosys queries
-        test_autosys_queries()
+        # Test direct tool usage (recommended)
+        test_direct_tool_usage()
         
-        # Uncomment to test agent
+        print("\n" + "="*60)
+        print("💡 USAGE RECOMMENDATIONS:")
+        print("="*60)
+        print("1. DIRECT USAGE (Most Reliable):")
+        print("   result = autosys_sql_tool.run('What is the status of job1?')")
+        print()
+        print("2. SIMPLE INTERFACE:")
+        print("   answer = simple_autosys_chat('Show me failed jobs')")
+        print()
+        print("3. Agent Usage (if needed):")
+        print("   # Use create_autosys_agent() but direct usage is more reliable")
+        
+        # Test simple interface
+        print("\n🧪 Testing Simple Interface:")
+        test_question = "What is the status of job1?"
+        simple_result = simple_autosys_chat(test_question)
+        print(f"Simple interface result: {simple_result}")
+        
+        # Uncomment to test agent (may have parsing issues)
         # create_autosys_agent()
         
         print("\n✅ Autosys tool ready!")
-        print("Usage: autosys_sql_tool.run('What is the status of my_job?')")
-        
-        # Quick test
-        print("\n🧪 Quick Test:")
-        test_result = autosys_sql_tool.run("Show me job status information")
-        print(f"Test result: {test_result}")
         
     except Exception as e:
         print(f"❌ Setup failed: {e}")
