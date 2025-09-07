@@ -1,4 +1,325 @@
+import os
+from typing import Dict, Any, Union
+from langchain.schema import AgentAction, AgentFinish
 
+# ------------------------------------
+# 1. Fixed extract_last_ai_message function
+# ------------------------------------
+def extract_last_ai_message(result) -> str:
+    """Extract the last AI message from agent response - handles multiple response types"""
+    try:
+        # Handle different types of agent responses
+        
+        # Case 1: Direct string response
+        if isinstance(result, str):
+            return result.strip()
+        
+        # Case 2: Dictionary with 'output' key (common with agents)
+        if isinstance(result, dict):
+            if 'output' in result:
+                return str(result['output']).strip()
+            elif 'result' in result:
+                return str(result['result']).strip()
+            elif 'answer' in result:
+                return str(result['answer']).strip()
+            # Try to get any string value from the dict
+            for key, value in result.items():
+                if isinstance(value, str) and len(value.strip()) > 0:
+                    return value.strip()
+        
+        # Case 3: AgentFinish object
+        if hasattr(result, 'return_values'):
+            if isinstance(result.return_values, dict):
+                return str(result.return_values.get('output', '')).strip()
+            return str(result.return_values).strip()
+        
+        # Case 4: List of messages (from some chat models)
+        if isinstance(result, list) and len(result) > 0:
+            # Get the last message
+            last_item = result[-1]
+            if hasattr(last_item, 'content'):
+                return last_item.content.strip()
+            elif isinstance(last_item, dict) and 'content' in last_item:
+                return last_item['content'].strip()
+            return str(last_item).strip()
+        
+        # Case 5: Object with content attribute
+        if hasattr(result, 'content'):
+            return result.content.strip()
+        
+        # Case 6: Convert whatever we got to string
+        result_str = str(result).strip()
+        if result_str and result_str != 'None':
+            return result_str
+        
+        # Fallback
+        return "I couldn't generate a proper response. Please try again."
+        
+    except Exception as e:
+        print(f"Error extracting AI message: {e}")
+        return f"Error processing response: {str(e)}"
+
+# ------------------------------------
+# 2. Enhanced get_chat_response function
+# ------------------------------------
+def get_chat_response(message: str, session_id: str, sql_agent) -> str:
+    """Enhanced chat response function with better error handling"""
+    try:
+        if not message or not message.strip():
+            return "Please provide a question about the database."
+        
+        message = message.strip()
+        print(f"🔍 Processing message: {message}")
+        
+        # Configuration for thread-safe execution
+        config = {
+            "configurable": {"thread_id": session_id},
+            "max_iterations": 3,
+            "handle_parsing_errors": True
+        }
+        
+        try:
+            # Method 1: Try the standard invoke
+            response = sql_agent.invoke(
+                {"input": message},
+                config=config
+            )
+            
+            # Extract the actual response content
+            output = extract_last_ai_message(response)
+            
+            if output and len(output.strip()) > 0:
+                return output
+            else:
+                # If we got empty output, try alternative extraction
+                return handle_empty_response(response, message, sql_agent)
+                
+        except Exception as invoke_error:
+            print(f"⚠️ Agent invoke failed: {invoke_error}")
+            
+            # Method 2: Try direct run method (some agents use this)
+            try:
+                if hasattr(sql_agent, 'run'):
+                    direct_response = sql_agent.run(message)
+                    return extract_last_ai_message(direct_response)
+                else:
+                    return fallback_response(message, sql_agent)
+                    
+            except Exception as run_error:
+                print(f"⚠️ Agent run failed: {run_error}")
+                return fallback_response(message, sql_agent)
+        
+    except Exception as e:
+        error_msg = f"Chat response error: {str(e)}"
+        print(f"❌ {error_msg}")
+        return f"I encountered an error processing your request: {str(e)}"
+
+# ------------------------------------
+# 3. Helper functions for error handling
+# ------------------------------------
+def handle_empty_response(response, message: str, sql_agent) -> str:
+    """Handle cases where agent returns empty responses"""
+    try:
+        print(f"🔄 Handling empty response: {type(response)}")
+        
+        # Try to extract from different response formats
+        if hasattr(response, '__dict__'):
+            response_dict = response.__dict__
+            print(f"Response attributes: {response_dict.keys()}")
+            
+            # Look for common output fields
+            for field in ['output', 'result', 'answer', 'content', 'text']:
+                if field in response_dict and response_dict[field]:
+                    return str(response_dict[field]).strip()
+        
+        # Try string conversion
+        response_str = str(response)
+        if response_str and response_str != 'None' and len(response_str.strip()) > 0:
+            return response_str.strip()
+        
+        return fallback_response(message, sql_agent)
+        
+    except Exception as e:
+        print(f"❌ Empty response handling failed: {e}")
+        return fallback_response(message, sql_agent)
+
+def fallback_response(message: str, sql_agent) -> str:
+    """Fallback response when agent fails"""
+    try:
+        # Try to access the tool directly if possible
+        if hasattr(sql_agent, 'tools') and len(sql_agent.tools) > 0:
+            first_tool = sql_agent.tools[0]
+            if hasattr(first_tool, 'run'):
+                tool_response = first_tool.run(message)
+                return f"Direct tool response: {tool_response}"
+        
+        # Generic fallback
+        return f"I couldn't process your query '{message}' properly. Please try rephrasing your question about the database."
+        
+    except Exception as e:
+        return f"I'm experiencing technical difficulties. Error: {str(e)}"
+
+# ------------------------------------
+# 4. Alternative simplified chat function
+# ------------------------------------
+def simple_chat_response(message: str, sql_agent) -> str:
+    """Simplified chat function that avoids complex parsing"""
+    try:
+        print(f"📝 Simple chat processing: {message}")
+        
+        # Direct approach - try multiple methods
+        methods_to_try = [
+            lambda: sql_agent.invoke({"input": message}),
+            lambda: sql_agent.run(message) if hasattr(sql_agent, 'run') else None,
+            lambda: sql_agent(message) if callable(sql_agent) else None
+        ]
+        
+        for method in methods_to_try:
+            try:
+                result = method()
+                if result is not None:
+                    extracted = extract_last_ai_message(result)
+                    if extracted and len(extracted.strip()) > 5:
+                        return extracted
+            except Exception as method_error:
+                print(f"⚠️ Method failed: {method_error}")
+                continue
+        
+        return "I couldn't generate a response. Please check your agent configuration."
+        
+    except Exception as e:
+        return f"Chat error: {str(e)}"
+
+# ------------------------------------
+# 5. Debug function to understand your agent's response format
+# ------------------------------------
+def debug_agent_response(message: str, sql_agent):
+    """Debug function to understand what your agent returns"""
+    print(f"\n🔍 DEBUGGING AGENT RESPONSE FOR: '{message}'")
+    print("=" * 60)
+    
+    try:
+        # Try invoke method
+        response = sql_agent.invoke({"input": message})
+        
+        print(f"Response type: {type(response)}")
+        print(f"Response content: {response}")
+        
+        if hasattr(response, '__dict__'):
+            print(f"Response attributes: {list(response.__dict__.keys())}")
+            for key, value in response.__dict__.items():
+                print(f"  {key}: {type(value)} = {value}")
+        
+        if isinstance(response, dict):
+            print("Response is a dictionary:")
+            for key, value in response.items():
+                print(f"  {key}: {type(value)} = {value}")
+        
+        # Try extraction
+        extracted = extract_last_ai_message(response)
+        print(f"\nExtracted message: '{extracted}'")
+        
+    except Exception as e:
+        print(f"Debug failed: {e}")
+
+# ------------------------------------
+# 6. Your updated chat functions with error handling
+# ------------------------------------
+def get_chat_response_robust(message: str, session_id: str, sql_agent) -> str:
+    """Robust version of your chat function"""
+    
+    # First, let's debug the response to understand the format
+    if os.getenv('DEBUG_MODE', '').lower() == 'true':
+        debug_agent_response(message, sql_agent)
+    
+    # Use the enhanced chat response
+    try:
+        response = get_chat_response(message, session_id, sql_agent)
+        
+        # Additional cleanup for common issues
+        response = response.replace('\n\n', '\n').strip()
+        
+        # Remove any JSON formatting artifacts
+        if response.startswith('{') and response.endswith('}'):
+            try:
+                import json
+                parsed = json.loads(response)
+                if 'output' in parsed:
+                    response = parsed['output']
+            except:
+                pass  # Keep original response if JSON parsing fails
+        
+        return response
+        
+    except Exception as e:
+        return simple_chat_response(message, sql_agent)
+
+# ------------------------------------
+# 7. Usage example for your chatbot
+# ------------------------------------
+"""
+USAGE IN YOUR CHATBOT:
+
+# Replace your original get_chat_response function with:
+def get_chat_response(message: str, session_id: str) -> str:
+    return get_chat_response_robust(message, session_id, sql_agent)
+
+# Or use the simple version:
+def get_chat_response(message: str, session_id: str) -> str:
+    return simple_chat_response(message, sql_agent)
+
+# For debugging, set environment variable:
+os.environ['DEBUG_MODE'] = 'true'
+"""
+
+# ------------------------------------
+# 8. Test your functions
+# ------------------------------------
+def test_chat_functions(sql_agent):
+    """Test the chat functions with your agent"""
+    print("\n🧪 Testing Chat Functions")
+    print("=" * 50)
+    
+    test_messages = [
+        "What is the status of job1?",
+        "Show me all jobs",
+        "List failed jobs"
+    ]
+    
+    for i, msg in enumerate(test_messages, 1):
+        print(f"\n{i}. Testing: '{msg}'")
+        print("-" * 30)
+        
+        try:
+            # Test the robust function
+            result = get_chat_response_robust(msg, "test_session", sql_agent)
+            print(f"✅ Result: {result}")
+        except Exception as e:
+            print(f"❌ Error: {e}")
+            
+            # Try simple function as fallback
+            try:
+                simple_result = simple_chat_response(msg, sql_agent)
+                print(f"🔄 Simple fallback: {simple_result}")
+            except Exception as e2:
+                print(f"❌ Simple fallback also failed: {e2}")
+
+if __name__ == "__main__":
+    print("🚀 Enhanced Chat Functions for SQL Agent")
+    print("Replace your existing functions with these enhanced versions.")
+
+
+
+
+
+
+
+
+
+
+
+
+≠=======================
 format_instructions": """Use the following format:
 
 Question: the input question you must answer
