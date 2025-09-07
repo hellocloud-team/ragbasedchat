@@ -1,57 +1,407 @@
-streamlit
-google-generativeai
-python-dotenv
-langchain
-PyPDF2
-chromadb
-faiss-cpu
-langchain_google_genai
-langchain-community
-langchain-google-vertexai
 
+import os
+import sqlite3
+from typing import Dict, Any, Optional
+from dotenv import load_dotenv
 
+from langgraph.graph import StateGraph, END
+from langchain_openai import ChatOpenAI
+from langchain_community.utilities import SQLDatabase
+from langchain.tools import Tool
+from langchain.agents import initialize_agent, AgentType
+from sqlalchemy.exc import SQLAlchemyError
 
+# Load environment variables
+load_dotenv()
 
+# ------------------------------------
+# 1. Setup with proper initialization and error handling
+# ------------------------------------
+def setup_database_and_llm():
+    """Initialize database and LLM with proper error handling"""
+    try:
+        # Initialize LLM - make sure you have OPENAI_API_KEY set
+        llm = ChatOpenAI(
+            model="gpt-4o-mini", 
+            temperature=0,
+            openai_api_key=os.getenv("OPENAI_API_KEY")
+        )
+        
+        # Create SQLite database if it doesn't exist and add sample data
+        db_path = "mydb.db"
+        setup_sample_database(db_path)
+        
+        # Initialize SQLDatabase
+        db = SQLDatabase.from_uri(f"sqlite:///{db_path}")
+        
+        print("✅ Database and LLM initialized successfully")
+        print(f"📊 Available tables: {db.get_usable_table_names()}")
+        
+        return llm, db
+        
+    except Exception as e:
+        print(f"❌ Setup error: {e}")
+        print("Make sure you have:")
+        print("1. OPENAI_API_KEY environment variable set")
+        print("2. Required packages: pip install langgraph langchain-openai langchain-community")
+        raise
 
+def setup_sample_database(db_path: str):
+    """Create sample database with test data if it doesn't exist"""
+    if not os.path.exists(db_path):
+        print(f"📝 Creating sample database: {db_path}")
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        
+        # Create sample tables
+        cursor.execute('''
+            CREATE TABLE employees (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                department TEXT,
+                salary REAL,
+                hire_date DATE,
+                manager_id INTEGER
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE departments (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                budget REAL,
+                location TEXT
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE projects (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                department_id INTEGER,
+                budget REAL,
+                start_date DATE,
+                status TEXT,
+                FOREIGN KEY (department_id) REFERENCES departments(id)
+            )
+        ''')
+        
+        # Insert sample data
+        employees_data = [
+            (1, 'John Smith', 'Engineering', 95000, '2022-01-15', None),
+            (2, 'Jane Doe', 'Engineering', 87000, '2022-03-20', 1),
+            (3, 'Mike Johnson', 'Sales', 75000, '2021-11-10', None),
+            (4, 'Sarah Wilson', 'Sales', 68000, '2023-01-05', 3),
+            (5, 'David Brown', 'Marketing', 72000, '2022-07-12', None),
+            (6, 'Lisa Garcia', 'HR', 65000, '2021-09-18', None),
+            (7, 'Tom Miller', 'Engineering', 92000, '2023-02-28', 1),
+            (8, 'Amy Chen', 'Marketing', 70000, '2022-12-01', 5),
+        ]
+        
+        departments_data = [
+            (1, 'Engineering', 500000, 'San Francisco'),
+            (2, 'Sales', 300000, 'New York'),
+            (3, 'Marketing', 200000, 'Los Angeles'),
+            (4, 'HR', 150000, 'Chicago'),
+        ]
+        
+        projects_data = [
+            (1, 'Mobile App Development', 1, 250000, '2023-01-01', 'Active'),
+            (2, 'Sales Campaign Q2', 2, 100000, '2023-04-01', 'Completed'),
+            (3, 'Website Redesign', 3, 80000, '2023-02-15', 'Active'),
+            (4, 'HR System Upgrade', 4, 60000, '2023-03-01', 'Planning'),
+        ]
+        
+        cursor.executemany('INSERT INTO employees VALUES (?, ?, ?, ?, ?, ?)', employees_data)
+        cursor.executemany('INSERT INTO departments VALUES (?, ?, ?, ?)', departments_data)
+        cursor.executemany('INSERT INTO projects VALUES (?, ?, ?, ?, ?, ?)', projects_data)
+        
+        conn.commit()
+        conn.close()
+        print("✅ Sample database created with test data")
 
+# Initialize components
+llm, db = setup_database_and_llm()
 
-#!/bin/bash
+# ------------------------------------
+# 2. Enhanced workflow functions with better error handling
+# ------------------------------------
+def generate_sql(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Generate SQL from natural language with enhanced prompting"""
+    try:
+        schema = db.get_table_info()
+        question = state["question"]
+        
+        prompt = f"""
+You are an expert SQLite database analyst.
 
-# Function to validate input format
-validate_input() {
-    local input="$1"
+Database Schema:
+{schema}
+
+User Question: {question}
+
+Requirements:
+1. Write a correct SQLite query that answers the question
+2. Use proper SQLite syntax 
+3. Include appropriate JOINs, WHERE clauses, ORDER BY, and LIMIT as needed
+4. Handle potential NULL values
+5. Use aggregate functions when appropriate (COUNT, SUM, AVG, etc.)
+6. Return ONLY the SQL query, no explanations or formatting
+
+SQL Query:
+"""
+        
+        response = llm.invoke(prompt)
+        sql = response.content.strip()
+        
+        # Clean up any markdown formatting
+        sql = sql.replace("```sql", "").replace("```", "").strip()
+        
+        print(f"🔍 Generated SQL: {sql}")
+        return {"sql": sql, "question": state["question"]}
+        
+    except Exception as e:
+        print(f"❌ Error in generate_sql: {e}")
+        return {"sql": "", "error": str(e), "question": state["question"]}
+
+def run_sql(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Execute SQL with comprehensive error handling"""
+    sql = state["sql"]
+    question = state["question"]
     
-    # Regular expression:
-    # - DYNAMIC_APP: Uppercase letters, numbers, hyphens, 1-63 chars
-    # - Static part: _NONPROD_K8S@
-    # - DYNAMIC_EC_DT: Uppercase letters, numbers, hyphens, 1-63 chars
-    # - Each dynamic part: Starts/ends with alphanumeric
-    local regex='^[A-Z0-9]([A-Z0-9-]{0,61}[A-Z0-9])?_NONPROD_K8S@[A-Z0-9]([A-Z0-9-]{0,61}[A-Z0-9])?$'
+    if not sql or state.get("error"):
+        return {**state, "result": "No valid SQL query generated"}
+    
+    try:
+        print(f"⚡ Executing SQL: {sql}")
+        result = db.run(sql)
+        
+        if not result or result == "":
+            result = "No results found matching your criteria"
+        
+        print(f"📊 SQL Result: {result}")
+        return {**state, "result": str(result)}
+        
+    except SQLAlchemyError as e:
+        error_msg = f"Database error: {str(e)}"
+        print(f"❌ {error_msg}")
+        
+        # Try to fix common SQL issues
+        return handle_sql_error(state, error_msg)
+        
+    except Exception as e:
+        error_msg = f"Unexpected error: {str(e)}"
+        print(f"❌ {error_msg}")
+        return {**state, "result": error_msg}
 
-    # Check if input matches the regex
-    if [[ ! "$input" =~ $regex ]]; then
-        echo "Error: Input '$input' does not match the <APP>_NONPROD_K8S@<EC-DT> format. It must:"
-        echo "- Follow the structure: <APP>_NONPROD_K8S@<EC-DT>"
-        echo "- APP and EC-DT: Uppercase letters, numbers, hyphens, 1-63 chars"
-        echo "- APP and EC-DT: Start and end with alphanumeric characters"
-        echo "- Include '_NONPROD_K8S@' exactly between APP and EC-DT"
-        return 1
-    fi
+def handle_sql_error(state: Dict[str, Any], error: str) -> Dict[str, Any]:
+    """Attempt to fix SQL errors by regenerating query"""
+    try:
+        schema = db.get_table_info()
+        original_sql = state["sql"]
+        question = state["question"]
+        
+        prompt = f"""
+The following SQLite query failed with an error:
 
-    echo "Input '$input' is valid"
-    return 0
-}
+Original Query: {original_sql}
+Error: {error}
 
-# Main script
-echo "Enter the input value (format like <APP>_NONPROD_K8S@<EC-DT>):"
-read -r input
+Database Schema:
+{schema}
 
-# Check if input is empty
-if [[ -z "$input" ]]; then
-    echo "Error: Input cannot be empty"
-    exit 1
-fi
+Original Question: {question}
 
-# Validate the input
-validate_input "$input"
-exit $?
+Please fix the SQL query. Common SQLite issues to avoid:
+1. Incorrect table or column names
+2. Missing JOIN conditions
+3. Syntax errors
+4. Type mismatches
+
+Return ONLY the corrected SQL query:
+"""
+        
+        response = llm.invoke(prompt)
+        fixed_sql = response.content.strip().replace("```sql", "").replace("```", "").strip()
+        
+        print(f"🔧 Attempting to fix SQL: {fixed_sql}")
+        
+        # Try the fixed query
+        try:
+            result = db.run(fixed_sql)
+            if not result:
+                result = "No results found"
+            return {"sql": fixed_sql, "question": question, "result": str(result)}
+        except:
+            return {"sql": original_sql, "question": question, "result": f"Could not fix SQL error: {error}"}
+            
+    except Exception as e:
+        return {"sql": state["sql"], "question": state["question"], "result": f"Error handling failed: {str(e)}"}
+
+def summarize(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert SQL results to natural language with better formatting"""
+    try:
+        question = state["question"]
+        result = state["result"]
+        sql = state.get("sql", "")
+        
+        if "error" in result.lower() or not result:
+            return {**state, "answer": f"I apologize, but I encountered an issue: {result}"}
+        
+        prompt = f"""
+Original Question: {question}
+SQL Query Used: {sql}
+Query Results: {result}
+
+Please provide a clear, natural language answer to the user's question based on the SQL results.
+
+Guidelines:
+1. Answer directly and concisely
+2. Format numbers and data in a readable way
+3. If results are empty, explain what this means
+4. Provide context when helpful
+5. Don't mention the SQL query unless specifically relevant
+
+Natural Language Answer:
+"""
+        
+        response = llm.invoke(prompt)
+        answer = response.content.strip()
+        
+        print(f"✅ Final Answer: {answer}")
+        return {**state, "answer": answer}
+        
+    except Exception as e:
+        return {**state, "answer": f"Error generating summary: {str(e)}"}
+
+# ------------------------------------
+# 3. Build enhanced LangGraph
+# ------------------------------------
+def build_sql_workflow():
+    """Build the SQL processing workflow"""
+    workflow = StateGraph(dict)
+    
+    # Add nodes
+    workflow.add_node("generate_sql", generate_sql)
+    workflow.add_node("run_sql", run_sql)
+    workflow.add_node("summarize", summarize)
+    
+    # Add edges
+    workflow.add_edge("generate_sql", "run_sql")
+    workflow.add_edge("run_sql", "summarize")
+    workflow.add_edge("summarize", END)
+    
+    # Set entry point
+    workflow.set_entry_point("generate_sql")
+    
+    return workflow.compile()
+
+# Build the workflow
+app = build_sql_workflow()
+
+# ------------------------------------
+# 4. Enhanced Tool Creation
+# ------------------------------------
+def text_to_sql_tool_func(question: str) -> str:
+    """Enhanced tool function with better error handling"""
+    try:
+        if not question or question.strip() == "":
+            return "Please provide a valid question about the database."
+        
+        print(f"🚀 Processing question: {question}")
+        result = app.invoke({"question": question.strip()})
+        
+        answer = result.get("answer", "No answer generated")
+        return answer
+        
+    except Exception as e:
+        error_msg = f"Tool execution error: {str(e)}"
+        print(f"❌ {error_msg}")
+        return error_msg
+
+# Create the enhanced tool
+text_to_sql_tool = Tool(
+    name="DatabaseQuery",
+    func=text_to_sql_tool_func,
+    description="""
+    Query the company database to answer questions about employees, departments, and projects.
+    
+    This tool can answer questions like:
+    - "Who are the highest paid employees?"
+    - "How many employees are in each department?"
+    - "What is the average salary by department?"
+    - "Show me all active projects"
+    - "Which department has the largest budget?"
+    
+    Input: A natural language question about the data
+    Output: A natural language answer based on database query results
+    """
+)
+
+# ------------------------------------
+# 5. Testing and Usage Examples
+# ------------------------------------
+def test_tool():
+    """Test the tool with sample questions"""
+    print("🧪 Testing the SQL Tool...")
+    print("=" * 60)
+    
+    test_questions = [
+        "Show me the top 5 highest paid employees",
+        "How many employees are in each department?",
+        "What is the average salary across all employees?",
+        "List all projects and their status",
+        "Which department has the most employees?",
+        "Show me employees hired in 2022"
+    ]
+    
+    for i, question in enumerate(test_questions, 1):
+        print(f"\n{i}. Question: {question}")
+        try:
+            answer = text_to_sql_tool.run(question)
+            print(f"   Answer: {answer}")
+        except Exception as e:
+            print(f"   Error: {e}")
+        print("-" * 40)
+
+def create_agent_example():
+    """Example of using the tool with an agent"""
+    print("\n🤖 Creating Agent with SQL Tool...")
+    
+    try:
+        agent = initialize_agent(
+            tools=[text_to_sql_tool],
+            llm=ChatOpenAI(model="gpt-4o-mini", temperature=0),
+            agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
+            verbose=True
+        )
+        
+        # Test complex query
+        complex_query = "Can you analyze our workforce and tell me about salary distribution and department sizes?"
+        print(f"\n🔍 Complex Query: {complex_query}")
+        response = agent.run(complex_query)
+        print(f"🎯 Agent Response: {response}")
+        
+    except Exception as e:
+        print(f"❌ Agent creation failed: {e}")
+
+# ------------------------------------
+# 6. Main execution
+# ------------------------------------
+if __name__ == "__main__":
+    print("🚀 Enhanced SQLite LangGraph SQL Tool")
+    print("=" * 50)
+    
+    try:
+        # Test the tool
+        test_tool()
+        
+        # Uncomment to test agent
+        # create_agent_example()
+        
+        print("\n✅ Tool is ready for use!")
+        print("\nYou can now use text_to_sql_tool in your applications:")
+        print("result = text_to_sql_tool.run('Your question here')")
+        
+    except Exception as e:
+        print(f"❌ Execution failed: {e}")
