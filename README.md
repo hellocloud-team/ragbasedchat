@@ -1,3 +1,16 @@
+color = "#28a745" if status == "SUCCESS" else "#dc3545" if status == "FAILURE" else "#6c757d"
+                    
+                    html_parts.append(f"<tr><td>{i}</td><td style='font-family:monospace;font-size:10px'>{job_name}</td><td style='background:{color};color:white;padding:2px'>{status}</td><td>{start_time}</td></tr>")
+            
+            if len(result) > 20:
+                html_parts.append(f"<tr><td colspan='4'><em>...and {len(result)-20} more jobs</em></td></tr>")
+            
+            html_parts.append("</table>")
+            state["answer"] = "".join(html_parts)
+        
+        return state
+
+____
 def format_result_as_html_table(self, state: AutosysState) -> AutosysState:
     """Format Autosys results as an HTML table"""
     try:
