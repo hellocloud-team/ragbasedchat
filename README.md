@@ -1,3 +1,198 @@
+def format_result_as_html_table(self, state: AutosysState) -> AutosysState:
+    """Format Autosys results as an HTML table"""
+    try:
+        question = state.get("question", "")
+        result = state.get("result", "")
+        
+        if isinstance(result, str) and result.startswith('[') and result.endswith(']'):
+            try:
+                import ast
+                result = ast.literal_eval(result)
+            except:
+                pass
+        
+        if isinstance(result, (list, tuple)) and len(result) > 0:
+            # Start HTML table with inline CSS for better styling
+            html_parts = [
+                f"<h3>Autosys Query Results ({len(result)} jobs found)</h3>",
+                """
+                <table style="border-collapse: collapse; width: 100%; font-family: Arial, sans-serif; font-size: 12px;">
+                <thead>
+                    <tr style="background-color: #f2f2f2; border-bottom: 2px solid #ddd;">
+                        <th style="border: 1px solid #ddd; padding: 8px; text-align: left; font-weight: bold;">#</th>
+                        <th style="border: 1px solid #ddd; padding: 8px; text-align: left; font-weight: bold;">Job Name</th>
+                        <th style="border: 1px solid #ddd; padding: 8px; text-align: center; font-weight: bold;">Status</th>
+                        <th style="border: 1px solid #ddd; padding: 8px; text-align: center; font-weight: bold;">Start Time</th>
+                        <th style="border: 1px solid #ddd; padding: 8px; text-align: center; font-weight: bold;">End Time</th>
+                        <th style="border: 1px solid #ddd; padding: 8px; text-align: center; font-weight: bold;">Owner</th>
+                    </tr>
+                </thead>
+                <tbody>
+                """
+            ]
+            
+            # Process each row
+            for i, row in enumerate(result, 1):
+                if isinstance(row, (list, tuple)) and len(row) >= 4:
+                    job_name = str(row[0]).strip() if row[0] else "N/A"
+                    start_time = str(row[1]).strip() if len(row) > 1 and row[1] else "N/A"
+                    end_time = str(row[2]).strip() if len(row) > 2 and row[2] else "N/A"
+                    status = str(row[3]).strip() if len(row) > 3 and row[3] else "N/A"
+                    owner = str(row[4]).strip() if len(row) > 4 and row[4] else "N/A"
+                    
+                    # Clean up times - show only time if date is present
+                    if "/" in start_time and " " in start_time:
+                        start_time = start_time.split(" ")[1]
+                    if "/" in end_time and " " in end_time:
+                        end_time = end_time.split(" ")[1]
+                    
+                    # Get status color and display
+                    status_info = self._get_status_html(status)
+                    
+                    # Alternate row colors
+                    row_color = "#f9f9f9" if i % 2 == 0 else "#ffffff"
+                    
+                    # Create table row
+                    html_parts.append(f"""
+                    <tr style="background-color: {row_color};">
+                        <td style="border: 1px solid #ddd; padding: 6px; text-align: center;">{i}</td>
+                        <td style="border: 1px solid #ddd; padding: 6px; font-family: monospace; font-size: 11px;" title="{job_name}">{job_name}</td>
+                        <td style="border: 1px solid #ddd; padding: 6px; text-align: center;">{status_info}</td>
+                        <td style="border: 1px solid #ddd; padding: 6px; text-align: center; font-family: monospace;">{start_time}</td>
+                        <td style="border: 1px solid #ddd; padding: 6px; text-align: center; font-family: monospace;">{end_time}</td>
+                        <td style="border: 1px solid #ddd; padding: 6px; text-align: center;">{owner}</td>
+                    </tr>
+                    """)
+            
+            # Close table
+            html_parts.append("""
+                </tbody>
+                </table>
+                <p style="font-size: 11px; color: #666; margin-top: 10px;">
+                    <em>Generated from Autosys database query</em>
+                </p>
+            """)
+            
+            state["answer"] = "".join(html_parts)
+            
+        else:
+            state["answer"] = f"<p><strong>Autosys Results:</strong><br>{str(result)}</p>"
+        
+        return state
+        
+    except Exception as e:
+        state["answer"] = f"<p><strong>Error:</strong> {str(e)}</p><pre>{str(result)}</pre>"
+        return state
+
+def _get_status_html(self, status_code):
+    """Get HTML formatted status with color coding"""
+    status_map = {
+        'SU': ('SUCCESS', '#28a745', '#ffffff'),    # Green background, white text
+        'SUCCESS': ('SUCCESS', '#28a745', '#ffffff'),
+        'FA': ('FAILURE', '#dc3545', '#ffffff'),    # Red background, white text  
+        'FAILURE': ('FAILURE', '#dc3545', '#ffffff'),
+        'RU': ('RUNNING', '#007bff', '#ffffff'),    # Blue background, white text
+        'RUNNING': ('RUNNING', '#007bff', '#ffffff'),
+        'IN': ('INACTIVE', '#6c757d', '#ffffff'),   # Gray background, white text
+        'INACTIVE': ('INACTIVE', '#6c757d', '#ffffff'),
+        'TE': ('TERMINATED', '#fd7e14', '#000000'), # Orange background, black text
+        'ON': ('ON_NOEXEC', '#ffc107', '#000000'),  # Yellow background, black text
+        'OH': ('ON_HOLD', '#e83e8c', '#ffffff'),    # Pink background, white text
+        'QU': ('QUEUED', '#20c997', '#000000'),     # Teal background, black text
+        'AC': ('ACTIVATED', '#17a2b8', '#ffffff'),  # Cyan background, white text
+        'ST': ('STARTING', '#6f42c1', '#ffffff')    # Purple background, white text
+    }
+    
+    display_name, bg_color, text_color = status_map.get(status_code, (status_code, '#e9ecef', '#000000'))
+    
+    return f"""
+    <span style="
+        background-color: {bg_color}; 
+        color: {text_color}; 
+        padding: 3px 8px; 
+        border-radius: 4px; 
+        font-size: 10px; 
+        font-weight: bold;
+        display: inline-block;
+        min-width: 60px;
+        text-align: center;
+    ">{display_name}</span>
+    """
+
+# Alternative: Compact HTML table for better readability
+def format_result_as_compact_html(self, state: AutosysState) -> AutosysState:
+    """Format as compact HTML with better mobile responsiveness"""
+    try:
+        question = state.get("question", "")
+        result = state.get("result", "")
+        
+        if isinstance(result, str) and result.startswith('[') and result.endswith(']'):
+            try:
+                import ast
+                result = ast.literal_eval(result)
+            except:
+                pass
+        
+        if isinstance(result, (list, tuple)) and len(result) > 0:
+            html_parts = [
+                f"<div style='font-family: Arial, sans-serif;'>",
+                f"<h3 style='color: #333; margin-bottom: 15px;'>Autosys Jobs ({len(result)} found)</h3>",
+                "<div style='overflow-x: auto;'>"
+            ]
+            
+            for i, row in enumerate(result, 1):
+                if isinstance(row, (list, tuple)) and len(row) >= 4:
+                    job_name = str(row[0]).strip() if row[0] else "N/A"
+                    start_time = str(row[1]).strip() if len(row) > 1 and row[1] else "N/A"
+                    end_time = str(row[2]).strip() if len(row) > 2 and row[2] else "N/A" 
+                    status = str(row[3]).strip() if len(row) > 3 and row[3] else "N/A"
+                    owner = str(row[4]).strip() if len(row) > 4 and row[4] else "N/A"
+                    
+                    status_info = self._get_status_html(status)
+                    
+                    # Extract just time from datetime
+                    start_display = start_time.split(" ")[-1] if " " in start_time else start_time
+                    end_display = end_time.split(" ")[-1] if " " in end_time else end_time
+                    
+                    html_parts.append(f"""
+                    <div style='
+                        border: 1px solid #ddd; 
+                        margin-bottom: 8px; 
+                        padding: 10px; 
+                        background: {("#f8f9fa" if i % 2 == 0 else "#ffffff")};
+                        border-radius: 4px;
+                    '>
+                        <div style='display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap;'>
+                            <div style='flex: 1; min-width: 300px;'>
+                                <strong style='font-family: monospace; font-size: 12px;'>{job_name}</strong>
+                            </div>
+                            <div style='display: flex; gap: 15px; align-items: center; flex-wrap: wrap;'>
+                                <div>{status_info}</div>
+                                <div style='font-size: 11px; color: #666;'>
+                                    {start_display} → {end_display}
+                                </div>
+                                <div style='font-size: 11px; color: #666;'>{owner}</div>
+                            </div>
+                        </div>
+                    </div>
+                    """)
+            
+            html_parts.extend(["</div>", "</div>"])
+            state["answer"] = "".join(html_parts)
+            
+        else:
+            state["answer"] = f"<p><strong>Autosys Results:</strong><br>{str(result)}</p>"
+        
+        return state
+        
+    except Exception as e:
+        state["answer"] = f"<p><strong>Error:</strong> {str(e)}</p>"
+        return state
+
+
+
+
+_____________
 def format_result_as_table(self, state: AutosysState) -> AutosysState:
     """Format Autosys results as a table"""
     try:
