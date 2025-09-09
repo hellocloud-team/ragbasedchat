@@ -1,3 +1,122 @@
+
+def format_result(self, state: AutosysState) -> AutosysState:
+    """Format Autosys results for user-friendly display"""
+    try:
+        question = state.get("question", "")
+        result = state.get("result", "")
+        
+        print(f"DEBUG: Raw result type: {type(result)}")
+        print(f"DEBUG: Raw result content: {result}")
+        
+        formatted_lines = []
+        
+        # Handle different result formats
+        if isinstance(result, str):
+            # If it's a string representation of a list, parse it
+            if result.startswith('[') and result.endswith(']'):
+                try:
+                    import ast
+                    parsed_result = ast.literal_eval(result)
+                    result = parsed_result
+                    print(f"DEBUG: Parsed string to: {type(result)} with {len(result)} items")
+                except Exception as e:
+                    print(f"DEBUG: Failed to parse string: {e}")
+                    # If parsing fails, treat as single string result
+                    state["answer"] = f"Autosys Query Results:\n{result}"
+                    return state
+            else:
+                # Handle comma-separated or other string formats
+                lines = result.split('\n')
+                for line in lines:
+                    if line.strip() and 'ATSYS' in line:
+                        formatted_lines.append(f"• {line.strip()}")
+                
+                if formatted_lines:
+                    state["answer"] = f"Autosys Query Results for '{question}':\n\n" + "\n".join(formatted_lines)
+                    return state
+        
+        # Process list/tuple results
+        if isinstance(result, (list, tuple)):
+            print(f"DEBUG: Processing {len(result)} rows")
+            
+            for i, row in enumerate(result):
+                print(f"DEBUG: Row {i}: {row} (type: {type(row)})")
+                
+                if isinstance(row, (list, tuple)) and len(row) >= 4:
+                    # Extract fields safely
+                    job_name = str(row[0]).strip() if row[0] else "Unknown"
+                    start_time = str(row[1]).strip() if len(row) > 1 and row[1] else "N/A"
+                    end_time = str(row[2]).strip() if len(row) > 2 and row[2] else "N/A"
+                    status = str(row[3]).strip() if len(row) > 3 and row[3] else "Unknown"
+                    owner = str(row[4]).strip() if len(row) > 4 and row[4] else "N/A"
+                    
+                    # Translate status
+                    status_display = self._translate_autosys_status(status)
+                    
+                    # Format the line
+                    formatted_line = f"• **{job_name}**: {status_display}"
+                    if start_time != "N/A":
+                        formatted_line += f" (Start: {start_time}"
+                        if end_time != "N/A":
+                            formatted_line += f", End: {end_time}"
+                        formatted_line += ")"
+                    if owner != "N/A":
+                        formatted_line += f" - Owner: {owner}"
+                    
+                    formatted_lines.append(formatted_line)
+                    print(f"DEBUG: Added formatted line: {formatted_line}")
+                
+                elif isinstance(row, str):
+                    # Handle string rows
+                    if 'ATSYS' in row:
+                        formatted_lines.append(f"• {row}")
+        
+        # Generate final answer
+        if formatted_lines:
+            final_answer = f"**Autosys Query Results for '{question}':**\n\n" + "\n".join(formatted_lines)
+            print(f"DEBUG: Final answer has {len(formatted_lines)} lines")
+            state["answer"] = final_answer
+        else:
+            print("DEBUG: No formatted lines generated, using raw result")
+            state["answer"] = f"**Autosys Data:**\n{str(result)}"
+        
+        print(f"DEBUG: Final state answer length: {len(state.get('answer', ''))}")
+        return state
+        
+    except Exception as e:
+        print(f"DEBUG: Exception in format_result: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        state["answer"] = f"Error formatting Autosys response: {str(e)}\n\nRaw data: {str(result)}"
+        return state
+
+def _translate_autosys_status(self, status_code):
+    """Translate Autosys status codes to readable format"""
+    status_map = {
+        'SU': '✅ SUCCESS',
+        'FA': '❌ FAILURE', 
+        'RU': '🔄 RUNNING',
+        'IN': '⏸️ INACTIVE',
+        'TE': '⏹️ TERMINATED',
+        'ON': '🔵 ON_NOEXEC',
+        'OH': '🟡 ON_HOLD',
+        'QU': '⏳ QUEUED',
+        'AC': '🔀 ACTIVATED',
+        'ST': '🟢 STARTING'
+    }
+    return status_map.get(status_code, f"🔸 {status_code}")
+
+
+
+
+
+
+
+
+
+
+“___________
+
 import os
 from typing import Dict, Any, List, Optional, TypedDict
 from dotenv import load_dotenv
