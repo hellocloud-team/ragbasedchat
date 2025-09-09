@@ -1,4 +1,128 @@
+def format_result_as_table(self, state: AutosysState) -> AutosysState:
+    """Format Autosys results as a table"""
+    try:
+        question = state.get("question", "")
+        result = state.get("result", "")
+        
+        if isinstance(result, str) and result.startswith('[') and result.endswith(']'):
+            try:
+                import ast
+                result = ast.literal_eval(result)
+            except:
+                pass
+        
+        if isinstance(result, (list, tuple)) and len(result) > 0:
+            # Create table header
+            table_lines = [
+                "**Autosys Query Results:**",
+                "",
+                "| Job Name | Status | Start Time | End Time | Owner |",
+                "|----------|--------|------------|----------|-------|"
+            ]
+            
+            # Process each row
+            for row in result:
+                if isinstance(row, (list, tuple)) and len(row) >= 4:
+                    job_name = str(row[0]).strip() if row[0] else "N/A"
+                    start_time = str(row[1]).strip() if len(row) > 1 and row[1] else "N/A"
+                    end_time = str(row[2]).strip() if len(row) > 2 and row[2] else "N/A"
+                    status = str(row[3]).strip() if len(row) > 3 and row[3] else "N/A"
+                    owner = str(row[4]).strip() if len(row) > 4 and row[4] else "N/A"
+                    
+                    # Truncate long job names for table formatting
+                    if len(job_name) > 40:
+                        job_name = job_name[:37] + "..."
+                    
+                    # Format times (remove date, keep only time)
+                    if "/" in start_time:
+                        start_time = start_time.split(" ")[-1] if " " in start_time else start_time
+                    if "/" in end_time:
+                        end_time = end_time.split(" ")[-1] if " " in end_time else end_time
+                    
+                    # Translate status
+                    status_display = self._translate_autosys_status(status)
+                    
+                    # Add table row
+                    table_row = f"| {job_name} | {status_display} | {start_time} | {end_time} | {owner} |"
+                    table_lines.append(table_row)
+            
+            # Join all lines
+            state["answer"] = "\n".join(table_lines)
+            
+        else:
+            # Fallback for non-structured data
+            state["answer"] = f"**Autosys Results:**\n{str(result)}"
+        
+        return state
+        
+    except Exception as e:
+        state["answer"] = f"Error formatting table: {str(e)}\n\nRaw data:\n{str(result)}"
+        return state
 
+# Alternative: Simple formatted list (better for long job names)
+def format_result_as_list(self, state: AutosysState) -> AutosysState:
+    """Format Autosys results as a clean list"""
+    try:
+        question = state.get("question", "")
+        result = state.get("result", "")
+        
+        if isinstance(result, str) and result.startswith('[') and result.endswith(']'):
+            try:
+                import ast
+                result = ast.literal_eval(result)
+            except:
+                pass
+        
+        if isinstance(result, (list, tuple)) and len(result) > 0:
+            formatted_lines = ["**Autosys Query Results:**", ""]
+            
+            for i, row in enumerate(result, 1):
+                if isinstance(row, (list, tuple)) and len(row) >= 4:
+                    job_name = str(row[0]).strip() if row[0] else "N/A"
+                    start_time = str(row[1]).strip() if len(row) > 1 and row[1] else "N/A"
+                    end_time = str(row[2]).strip() if len(row) > 2 and row[2] else "N/A"
+                    status = str(row[3]).strip() if len(row) > 3 and row[3] else "N/A"
+                    owner = str(row[4]).strip() if len(row) > 4 and row[4] else "N/A"
+                    
+                    status_display = self._translate_autosys_status(status)
+                    
+                    formatted_lines.append(f"{i:2d}. **{job_name}**")
+                    formatted_lines.append(f"    Status: {status_display}")
+                    formatted_lines.append(f"    Times: {start_time} → {end_time}")
+                    formatted_lines.append(f"    Owner: {owner}")
+                    formatted_lines.append("")  # Empty line between jobs
+            
+            state["answer"] = "\n".join(formatted_lines)
+            
+        else:
+            state["answer"] = f"**Autosys Results:**\n{str(result)}"
+        
+        return state
+        
+    except Exception as e:
+        state["answer"] = f"Error formatting results: {str(e)}"
+        return state
+
+def _translate_autosys_status(self, status_code):
+    """Translate status codes to readable format"""
+    status_map = {
+        'SU': 'SUCCESS',
+        'FA': 'FAILURE', 
+        'RU': 'RUNNING',
+        'IN': 'INACTIVE',
+        'TE': 'TERMINATED',
+        'ON': 'ON_NOEXEC',
+        'OH': 'ON_HOLD',
+        'QU': 'QUEUED',
+        'AC': 'ACTIVATED',
+        'ST': 'STARTING'
+    }
+    return status_map.get(status_code, status_code)
+
+
+
+
+_______
 def format_result(self, state: AutosysState) -> AutosysState:
     """Format Autosys results for user-friendly display"""
     try:
