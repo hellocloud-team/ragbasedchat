@@ -1,3 +1,579 @@
+from langchain.tools import BaseTool
+from typing import Dict, Any, Optional, List
+import json
+import logging
+from datetime import datetime
+from pydantic import BaseModel, Field
+import re
+
+class AutosysQueryInput(BaseModel):
+    """Input schema for Autosys Query Tool"""
+    question: str = Field(description="Natural language question about Autosys jobs")
+
+class AutosysLLMQueryTool(BaseTool):
+    """
+    LangChain-compatible Autosys Database Query Tool
+    Uses existing AutosysOracleDatabase connection and external LLM
+    """
+    
+    name: str = "AutosysQuery"
+    description: str = """
+    Query Autosys job scheduler database using natural language.
+    Supports questions about job status, schedules, failures, and performance.
+    Returns formatted HTML results with professional styling.
+    
+    Input should be a natural language question about Autosys jobs.
+    Examples:
+    - "Show me all failed jobs today"
+    - "Which ATSYS jobs are currently running?"
+    - "List jobs owned by user ADMIN"
+    - "Show job history for the last 24 hours"
+    """
+    
+    args_schema = AutosysQueryInput
+    
+    def __init__(self, autosys_db, llm_instance, max_results: int = 50):
+        """
+        Initialize tool with existing database connection and LLM
+        
+        Args:
+            autosys_db: Your existing AutosysOracleDatabase instance
+            llm_instance: Pre-configured LLM instance (from your config)
+            max_results: Maximum number of results to return
+        """
+        super().__init__()
+        self.autosys_db = autosys_db  # Use your existing database connection
+        self.llm = llm_instance       # Use your existing LLM instance
+        self.max_results = max_results
+        self.logger = logging.getLogger(self.__class__.__name__)
+        
+        # Verify database connection
+        self._verify_db_connection()
+
+    def _verify_db_connection(self) -> bool:
+        """Test database connection using your existing connection"""
+        try:
+            # Test the connection using your existing database class
+            if hasattr(self.autosys_db, 'connection') and self.autosys_db.connection:
+                self.logger.info("AutosysOracleDatabase connection verified")
+                return True
+            elif hasattr(self.autosys_db, 'connect'):
+                # Try to connect if not already connected
+                self.autosys_db.connect()
+                self.logger.info("AutosysOracleDatabase connection established")
+                return True
+            else:
+                self.logger.warning("Could not verify database connection")
+                return False
+        except Exception as e:
+            self.logger.error(f"Database connection verification failed: {str(e)}")
+            return False
+
+    def _run(self, question: str) -> str:
+        """
+        Main tool execution method (LangChain interface)
+        
+        Args:
+            question: Natural language question about Autosys
+            
+        Returns:
+            Formatted HTML response
+        """
+        try:
+            self.logger.info(f"AutosysQuery tool called: {question}")
+            
+            # Step 1: Generate SQL using external LLM
+            sql_query = self._generate_sql_with_llm(question)
+            
+            # Step 2: Execute query using existing database connection
+            query_result = self._execute_query_with_existing_db(sql_query)
+            
+            # Step 3: Format results using external LLM
+            formatted_output = self._format_results_with_llm(query_result, question)
+            
+            return formatted_output
+            
+        except Exception as e:
+            self.logger.error(f"Tool execution failed: {str(e)}")
+            return self._create_error_response(str(e))
+
+    def _generate_sql_with_llm(self, user_question: str) -> str:
+        """Generate SQL using external LLM instance"""
+        
+        sql_generation_prompt = f"""
+You are an expert Oracle SQL generator for Autosys job scheduler database queries.
+
+AUTOSYS DATABASE SCHEMA:
+- Table: aedbadmin.ujo_jobst (Job Status)
+  * job_name: VARCHAR2 - Job identifier (e.g., 'ATSYS.job_name.c')
+  * status: NUMBER - Status code (SU=Success, FA=Failure, RU=Running, IN=Inactive)
+  * last_start: NUMBER - Last start time (epoch seconds)
+  * last_end: NUMBER - Last end time (epoch seconds)  
+  * joid: NUMBER - Job ID (foreign key)
+
+- Table: aedbadmin.ujo_job (Job Details)
+  * joid: NUMBER - Job ID (primary key)
+  * owner: VARCHAR2 - Job owner/user
+  * machine: VARCHAR2 - Execution machine
+  * job_type: VARCHAR2 - Type of job
+
+- Table: aedbadmin.UJO_INTCODES (Status Translation)
+  * code: NUMBER - Status code number
+  * TEXT: VARCHAR2 - Human readable status text
+
+ORACLE SQL PATTERNS FOR AUTOSYS:
+- Time conversion: TO_CHAR(TO_DATE('01.01.1970 19:00:00','DD.MM.YYYY HH24:Mi:Ss') + (last_start / 86400), 'MM/DD/YYYY HH24:Mi:Ss')
+- Standard joins: js INNER JOIN aedbadmin.ujo_job j ON j.joid = js.joid
+- Status lookup: LEFT JOIN aedbadmin.UJO_INTCODES ic ON js.status = ic.code
+- Recent jobs: WHERE js.last_start >= (SYSDATE - INTERVAL '1' DAY) * 86400
+- Job name search: WHERE UPPER(js.job_name) LIKE UPPER('%pattern%')
+- Result limiting: WHERE ROWNUM <= {self.max_results}
+
+COMMON STATUS CODES:
+- SU or 4 = SUCCESS
+- FA or 7 = FAILURE  
+- RU or 8 = RUNNING
+- IN or 5 = INACTIVE
+
+USER QUESTION: "{user_question}"
+
+Generate a complete Oracle SQL query that answers this question.
+Use proper table aliases (js for ujo_jobst, j for ujo_job, ic for UJO_INTCODES).
+Include relevant columns like job_name, status text, start/end times, owner.
+Always use the full table names with aedbadmin schema prefix.
+Ensure proper WHERE clauses and result limiting.
+
+Return ONLY the SQL query without any explanations, markdown, or formatting.
+"""
+
+        try:
+            # Use external LLM instance
+            sql_response = self.llm.invoke(sql_generation_prompt)
+            
+            # Extract SQL from response
+            sql_query = sql_response.content if hasattr(sql_response, 'content') else str(sql_response)
+            
+            # Clean up formatting
+            sql_query = self._clean_sql_response(sql_query)
+            
+            # Ensure result limiting
+            sql_query = self._ensure_result_limiting(sql_query)
+            
+            self.logger.info(f"Generated SQL: {sql_query[:100]}...")
+            return sql_query
+            
+        except Exception as e:
+            self.logger.error(f"SQL generation failed: {str(e)}")
+            return self._get_fallback_sql(user_question)
+
+    def _clean_sql_response(self, sql_query: str) -> str:
+        """Clean up SQL response from LLM"""
+        # Remove markdown formatting
+        sql_query = re.sub(r'```sql\s*', '', sql_query, flags=re.IGNORECASE)
+        sql_query = re.sub(r'```\s*', '', sql_query)
+        
+        # Remove extra whitespace and newlines
+        sql_query = ' '.join(sql_query.split())
+        
+        # Ensure it ends properly
+        sql_query = sql_query.strip()
+        if not sql_query.endswith(';'):
+            sql_query += ';'
+            
+        return sql_query
+
+    def _ensure_result_limiting(self, sql_query: str) -> str:
+        """Ensure query has result limiting"""
+        sql_upper = sql_query.upper()
+        
+        if 'ROWNUM' not in sql_upper and 'LIMIT' not in sql_upper:
+            # Add ROWNUM limiting
+            if 'WHERE' in sql_upper:
+                # Insert ROWNUM condition into existing WHERE clause
+                where_pos = sql_upper.find('WHERE')
+                before_where = sql_query[:where_pos + 5]  # Include 'WHERE'
+                after_where = sql_query[where_pos + 5:]
+                sql_query = f"{before_where} ROWNUM <= {self.max_results} AND{after_where}"
+            else:
+                # Add WHERE clause with ROWNUM
+                order_pos = sql_upper.find('ORDER BY')
+                if order_pos > 0:
+                    before_order = sql_query[:order_pos]
+                    after_order = sql_query[order_pos:]
+                    sql_query = f"{before_order} WHERE ROWNUM <= {self.max_results} {after_order}"
+                else:
+                    sql_query = sql_query.rstrip(';') + f" WHERE ROWNUM <= {self.max_results};"
+        
+        return sql_query
+
+    def _execute_query_with_existing_db(self, sql_query: str) -> Dict[str, Any]:
+        """Execute SQL query using your existing AutosysOracleDatabase"""
+        
+        try:
+            start_time = datetime.now()
+            
+            # Use your existing database connection method
+            # This assumes your AutosysOracleDatabase has a method to execute queries
+            # Adjust the method name based on your actual implementation
+            
+            if hasattr(self.autosys_db, 'execute_query'):
+                raw_results = self.autosys_db.execute_query(sql_query)
+            elif hasattr(self.autosys_db, 'run'):
+                raw_results = self.autosys_db.run(sql_query)
+            elif hasattr(self.autosys_db, 'query'):
+                raw_results = self.autosys_db.query(sql_query)
+            else:
+                # Fallback: try to access connection directly
+                if hasattr(self.autosys_db, 'connection') and self.autosys_db.connection:
+                    with self.autosys_db.connection.cursor() as cursor:
+                        cursor.execute(sql_query)
+                        columns = [desc[0] for desc in cursor.description] if cursor.description else []
+                        raw_results = cursor.fetchall()
+                        
+                        # Convert to list of dictionaries
+                        results = []
+                        for row in raw_results:
+                            row_dict = {}
+                            for i, value in enumerate(row):
+                                col_name = columns[i] if i < len(columns) else f"COLUMN_{i}"
+                                row_dict[col_name] = self._format_oracle_value(value)
+                            results.append(row_dict)
+                        raw_results = results
+                else:
+                    raise Exception("Could not access database connection")
+            
+            # Handle different return types from your database class
+            if isinstance(raw_results, str):
+                # If returned as string, try to parse it
+                try:
+                    import ast
+                    if raw_results.startswith('[') and raw_results.endswith(']'):
+                        parsed_results = ast.literal_eval(raw_results)
+                        results = self._convert_to_dict_list(parsed_results)
+                    else:
+                        # Handle as single result or error
+                        results = [{"result": raw_results}]
+                except:
+                    results = [{"result": raw_results}]
+            elif isinstance(raw_results, list):
+                # Convert tuples to dictionaries if needed
+                results = self._convert_to_dict_list(raw_results)
+            else:
+                results = [{"result": str(raw_results)}]
+            
+            execution_time = (datetime.now() - start_time).total_seconds()
+            
+            return {
+                "success": True,
+                "results": results,
+                "row_count": len(results),
+                "execution_time": execution_time,
+                "sql_query": sql_query
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Query execution failed: {str(e)}")
+            return {
+                "success": False,
+                "error": str(e),
+                "results": [],
+                "sql_query": sql_query
+            }
+
+    def _convert_to_dict_list(self, raw_results: List) -> List[Dict]:
+        """Convert list of tuples to list of dictionaries"""
+        results = []
+        
+        for item in raw_results:
+            if isinstance(item, (tuple, list)):
+                # Convert tuple/list to dictionary with generic column names
+                row_dict = {}
+                for i, value in enumerate(item):
+                    col_name = self._get_column_name(i, value)
+                    row_dict[col_name] = self._format_oracle_value(value)
+                results.append(row_dict)
+            elif isinstance(item, dict):
+                # Already a dictionary
+                results.append(item)
+            else:
+                # Single value
+                results.append({"VALUE": str(item)})
+        
+        return results
+
+    def _get_column_name(self, index: int, value: Any) -> str:
+        """Generate appropriate column name based on content"""
+        common_names = ["JOB_NAME", "START_TIME", "END_TIME", "STATUS", "OWNER", "MACHINE"]
+        
+        if index < len(common_names):
+            return common_names[index]
+        else:
+            return f"COLUMN_{index + 1}"
+
+    def _format_oracle_value(self, value: Any) -> str:
+        """Format Oracle-specific data types"""
+        if hasattr(value, 'read'):  # CLOB/BLOB
+            return value.read()
+        elif isinstance(value, datetime):
+            return value.strftime('%Y-%m-%d %H:%M:%S')
+        else:
+            return str(value) if value is not None else ""
+
+    def _format_results_with_llm(self, query_result: Dict[str, Any], user_question: str) -> str:
+        """Format results using external LLM instance"""
+        
+        if not query_result["success"]:
+            return self._create_error_response(
+                query_result["error"], 
+                query_result.get("sql_query")
+            )
+        
+        results = query_result["results"]
+        
+        if not results:
+            return """
+            <div style='padding: 15px; background: #fff3cd; border: 1px solid #ffeaa7; border-radius: 5px;'>
+                <h4 style='margin: 0 0 10px 0; color: #856404;'>No Results Found</h4>
+                <p style='margin: 0; color: #856404;'>No Autosys jobs match your query criteria.</p>
+            </div>
+            """
+        
+        # Prepare data for formatting (limit for LLM processing)
+        sample_size = min(len(results), 15)
+        sample_data = results[:sample_size]
+        
+        formatting_prompt = f"""
+Create professional HTML formatting for these Autosys database query results.
+
+USER QUESTION: "{user_question}"
+EXECUTION TIME: {query_result.get('execution_time', 0):.2f} seconds  
+TOTAL RESULTS: {len(results)} jobs (showing first {sample_size})
+
+QUERY RESULTS TO FORMAT:
+{json.dumps(sample_data, indent=2, default=str)}
+
+FORMATTING REQUIREMENTS:
+1. Create responsive HTML with inline CSS only - no external stylesheets
+2. Use professional styling with good contrast and readability
+3. Color-code job status with badges:
+   - SUCCESS/SU: Green background (#28a745) with white text
+   - FAILURE/FA: Red background (#dc3545) with white text  
+   - RUNNING/RU: Blue background (#007bff) with white text
+   - INACTIVE/IN: Gray background (#6c757d) with white text
+4. Include a summary section at the top showing total jobs and key statistics
+5. Use monospace font for job names for better readability
+6. Make tables responsive for mobile devices
+7. Keep output concise to avoid truncation - prioritize most important info
+8. Add subtle hover effects for better user experience
+9. Include proper spacing and margins for professional appearance
+10. Show execution time and result count in a footer
+
+Create a clean, modern design that's easy to scan and read.
+Return only the formatted HTML without any explanations or markdown.
+"""
+
+        try:
+            # Use external LLM for formatting
+            format_response = self.llm.invoke(formatting_prompt)
+            formatted_html = format_response.content if hasattr(format_response, 'content') else str(format_response)
+            
+            # Add tool metadata footer
+            metadata = f"""
+            <div style="margin-top: 15px; padding: 8px 12px; background: #f8f9fa; border-radius: 4px; font-size: 11px; color: #666; border-left: 3px solid #007bff;">
+                <strong>AutosysQuery Tool</strong> • 
+                Generated {query_result['row_count']} results in {query_result['execution_time']:.2f}s • 
+                Oracle Database via LLM
+            </div>
+            """
+            
+            return formatted_html + metadata
+            
+        except Exception as e:
+            self.logger.error(f"Result formatting failed: {str(e)}")
+            return self._create_fallback_format(results, user_question, query_result.get('execution_time', 0))
+
+    def _create_error_response(self, error_msg: str, sql_query: Optional[str] = None) -> str:
+        """Generate HTML error response"""
+        html = f"""
+        <div style="border: 1px solid #dc3545; background: #f8d7da; color: #721c24; padding: 15px; border-radius: 5px; margin: 10px 0;">
+            <h4 style="margin: 0 0 10px 0; color: #721c24; font-size: 16px;">AutosysQuery Tool Error</h4>
+            <p style="margin: 0; font-size: 14px;"><strong>Error:</strong> {error_msg}</p>
+        """
+        
+        if sql_query:
+            html += f"""
+            <details style="margin-top: 10px;">
+                <summary style="cursor: pointer; color: #495057; font-size: 12px;">View Generated SQL Query</summary>
+                <pre style="background: #e9ecef; padding: 10px; margin-top: 5px; border-radius: 3px; font-size: 10px; overflow-x: auto; font-family: 'Courier New', monospace;">{sql_query}</pre>
+            </details>
+            """
+        
+        html += """
+            <p style="margin: 10px 0 0 0; font-size: 12px; color: #856404;">
+                <em>Tip: Try rephrasing your question or check if the job names/criteria exist in the database.</em>
+            </p>
+        </div>
+        """
+        return html
+
+    def _create_fallback_format(self, results: List[Dict], question: str, execution_time: float = 0) -> str:
+        """Simple fallback HTML formatting if LLM formatting fails"""
+        if not results:
+            return "<p style='padding: 15px; background: #f8f9fa;'>No results found.</p>"
+        
+        html = f"""
+        <div style="font-family: Arial, sans-serif;">
+            <h3 style="color: #333; margin-bottom: 15px;">Autosys Query Results</h3>
+            <p style="color: #666; font-size: 12px; margin-bottom: 15px;">
+                Found {len(results)} jobs • Executed in {execution_time:.2f}s
+            </p>
+            <div style="overflow-x: auto;">
+                <table style="border-collapse: collapse; width: 100%; font-size: 12px; background: white;">
+                    <thead>
+                        <tr style="background: #f2f2f2;">
+        """
+        
+        # Table headers
+        if results:
+            for key in results[0].keys():
+                html += f"<th style='border: 1px solid #ddd; padding: 8px; text-align: left; font-weight: bold;'>{key}</th>"
+            html += "</tr></thead><tbody>"
+            
+            # Table rows
+            for i, row in enumerate(results[:25]):  # Limit for fallback
+                bg_color = "#f9f9f9" if i % 2 == 0 else "#ffffff"
+                html += f"<tr style='background: {bg_color};'>"
+                
+                for key, value in row.items():
+                    # Truncate long values
+                    display_value = str(value)
+                    if len(display_value) > 60:
+                        display_value = display_value[:57] + "..."
+                    
+                    # Apply basic status color coding
+                    if key.upper() in ['STATUS', 'JOB_STATUS'] and value:
+                        if value.upper() in ['SUCCESS', 'SU']:
+                            cell_style = "background: #d4edda; color: #155724; padding: 4px 8px; font-weight: bold;"
+                        elif value.upper() in ['FAILURE', 'FA']:
+                            cell_style = "background: #f8d7da; color: #721c24; padding: 4px 8px; font-weight: bold;"
+                        elif value.upper() in ['RUNNING', 'RU']:
+                            cell_style = "background: #cce5f0; color: #004085; padding: 4px 8px; font-weight: bold;"
+                        else:
+                            cell_style = "border: 1px solid #ddd; padding: 6px;"
+                    else:
+                        cell_style = "border: 1px solid #ddd; padding: 6px;"
+                    
+                    html += f"<td style='{cell_style}'>{display_value}</td>"
+                html += "</tr>"
+        
+        html += """
+                </tbody>
+            </table>
+        </div>
+        <p style="margin-top: 10px; font-size: 11px; color: #999;">
+            <em>Fallback formatting - LLM formatting temporarily unavailable</em>
+        </p>
+    </div>
+        """
+        return html
+
+    def _get_fallback_sql(self, user_question: str) -> str:
+        """Fallback SQL query if LLM generation fails"""
+        # Analyze question for basic patterns
+        question_lower = user_question.lower()
+        
+        if 'failed' in question_lower or 'failure' in question_lower:
+            status_condition = "js.status = 7"  # FA status code
+        elif 'running' in question_lower:
+            status_condition = "js.status = 8"  # RU status code  
+        elif 'success' in question_lower:
+            status_condition = "js.status = 4"  # SU status code
+        else:
+            status_condition = "1=1"  # All jobs
+        
+        return f"""
+        SELECT 
+            js.job_name,
+            TO_CHAR(TO_DATE('01.01.1970 19:00:00','DD.MM.YYYY HH24:Mi:Ss') + (js.last_start / 86400), 'MM/DD/YYYY HH24:Mi:Ss') AS start_time,
+            TO_CHAR(TO_DATE('01.01.1970 19:00:00','DD.MM.YYYY HH24:Mi:Ss') + (js.last_end / 86400), 'MM/DD/YYYY HH24:Mi:Ss') AS end_time,
+            NVL(ic.TEXT, 'UNKNOWN') AS job_status,
+            j.owner
+        FROM aedbadmin.ujo_jobst js
+        INNER JOIN aedbadmin.ujo_job j ON j.joid = js.joid
+        LEFT JOIN aedbadmin.UJO_INTCODES ic ON js.status = ic.code
+        WHERE {status_condition}
+        AND UPPER(js.job_name) LIKE UPPER('%ATSYS%')
+        AND ROWNUM <= {self.max_results}
+        ORDER BY js.last_start DESC;
+        """
+
+# Integration function for your existing setup
+def create_enhanced_autosys_tool(autosys_db, llm_instance, max_results=50):
+    """
+    Factory function to create the enhanced tool using your existing components
+    
+    Args:
+        autosys_db: Your existing AutosysOracleDatabase instance
+        llm_instance: Your LLM instance from get_llm("langchain")
+        max_results: Maximum results to return
+    
+    Returns:
+        AutosysLLMQueryTool ready for use in your agent
+    """
+    return AutosysLLMQueryTool(
+        autosys_db=autosys_db,
+        llm_instance=llm_instance,
+        max_results=max_results
+    )
+
+# Complete integration example for your code:
+"""
+# In your main file where you have:
+oracle_uri = "oracle+oracledb://***:***@***/service_name=service_name"
+autosys_db = AutosysOracleDatabase(oracle_uri)
+llm = get_llm("langchain")
+
+# Replace your existing tool creation with:
+autosys_sql_tool_enhanced = create_enhanced_autosys_tool(
+    autosys_db=autosys_db,
+    llm_instance=llm,
+    max_results=50
+)
+
+# Update your tools list:
+tools = [autosys_sql_tool_enhanced]
+
+# Your existing agent initialization code remains the same:
+sql_agent = initialize_agent(
+    tools=tools,
+    llm=llm,
+    agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
+    verbose=True,
+    checkpointer=checkpointer,
+    handle_parsing_errors=True,
+    max_iterations=3,
+    early_stopping_method="generate",
+    agent_kwargs={
+        "format_instructions": '''
+Use the following format:
+Question: the input question you must answer
+Thought: you should always think about what to do
+Action: the action to take, should be AutosysQuery
+Action Input: the input to the action
+Observation: the tool will populate this automatically
+... (this Thought/Action/Action Input/Observation can repeat N times)
+Thought: I now know the final answer
+Final Answer: Include all results from the query output, format each job on a new line.
+IMPORTANT: Do NOT include multiple actions and final answers in the same response.
+'''
+    },
+    "output_parser": output_parser
+)
+"""
+
+
+
+------------
 color = "#28a745" if status == "SUCCESS" else "#dc3545" if status == "FAILURE" else "#6c757d"
                     
                     html_parts.append(f"<tr><td>{i}</td><td style='font-family:monospace;font-size:10px'>{job_name}</td><td style='background:{color};color:white;padding:2px'>{status}</td><td>{start_time}</td></tr>")
