@@ -1,3 +1,299 @@
+
+import re
+import logging
+from typing import Dict, Any, Optional, Union
+
+def extract_last_ai_message(result: Union[Dict, str, Any]) -> str:
+    """
+    Extract the final answer from agent response, handling mixed formats and LangGraph responses.
+    Enhanced version that handles both traditional agents and LangGraph outputs.
+    """
+    try:
+        # Handle LangGraph response format
+        if isinstance(result, dict):
+            # Check for LangGraph formatted_output first
+            if "formatted_output" in result and result["formatted_output"]:
+                return result["formatted_output"].strip()
+            
+            # Check for success field and formatted content
+            if result.get("success") and "formatted_output" in result:
+                return result["formatted_output"].strip()
+            
+            # Traditional response formats
+            if "answer" in result and result["answer"]:
+                return result["answer"].strip()
+            elif "result" in result and result["result"]:
+                return result["result"].strip()
+            elif "content" in result and result["content"]:
+                return result["content"].strip()
+            elif "text" in result and result["text"]:
+                return result["text"].strip()
+            elif "output" in result and result["output"]:
+                return result["output"].strip()
+        
+        # Handle string responses
+        if isinstance(result, str):
+            result = result.strip()
+            
+            # Look for 'Final Answer:' pattern first (most specific)
+            final_answer_match = re.search(r"Final Answer:\s*(.+?)(?=\n\n|\n(?=\w+:)|\Z)", result, re.DOTALL | re.IGNORECASE)
+            if final_answer_match:
+                return final_answer_match.group(1).strip()
+            
+            # Look for HTML content (likely formatted output)
+            if "<html>" in result.lower() or "<div>" in result.lower() or "<table>" in result.lower():
+                return result
+            
+            # If it's just a plain response without markers, return as-is
+            if len(result) > 0 and not any(marker in result.lower() for marker in ['thought:', 'action:', 'observation:']):
+                return result
+        
+        # Handle other response types from different agents
+        if hasattr(result, 'content'):
+            return result.content.strip()
+        elif hasattr(result, 'text'):
+            return result.text.strip()
+        elif hasattr(result, 'output'):
+            return result.output.strip()
+        
+        # Fallback: convert to string
+        result_str = str(result).strip()
+        if result_str and result_str != "None":
+            return result_str
+            
+        return "No response generated."
+        
+    except Exception as e:
+        logging.error(f"Error extracting AI message: {str(e)}")
+        return f"Error processing response: {str(e)}"
+
+def get_chat_response(message: str, session_id: str) -> str:
+    """
+    Enhanced chat response function that integrates LangGraph Autosys system
+    with fallback to traditional agent approach.
+    """
+    try:
+        # Input validation
+        if not message or not message.strip():
+            return "Please provide a question about the database."
+        
+        message = message.strip()
+        print(f"🔍 Processing: {message}")
+        
+        # Session configuration for LangGraph
+        config = {"configurable": {"thread_id": session_id}}
+        
+        try:
+            # Primary approach: Use LangGraph Autosys System
+            print("🤖 Using LangGraph Autosys System...")
+            
+            # Initialize LangGraph system (assuming it's globally available or injected)
+            # You'll need to make this available in your scope
+            if 'autosys_langgraph_system' in globals():
+                langgraph_result = autosys_langgraph_system.query(message, config)
+                
+                print(f"📊 LangGraph response type: {type(langgraph_result)}")
+                print(f"📋 LangGraph response preview: {str(langgraph_result)[:200]}...")
+                
+                if langgraph_result.get("success", False):
+                    final_response = extract_last_ai_message(langgraph_result)
+                    if final_response and final_response != "No response generated.":
+                        print("✅ LangGraph response successful")
+                        return final_response
+                    else:
+                        print("⚠️ LangGraph response empty, trying fallback")
+                else:
+                    print(f"❌ LangGraph failed: {langgraph_result.get('error', 'Unknown error')}")
+            else:
+                print("⚠️ LangGraph system not available, using fallback")
+        
+        except Exception as langgraph_error:
+            print(f"❌ LangGraph system error: {str(langgraph_error)}")
+        
+        # Fallback approach: Use traditional SQL agent
+        try:
+            print("🔄 Using traditional SQL agent fallback...")
+            
+            # Your existing agent invocation
+            response = sql_agent.invoke(
+                {
+                    "input": message,
+                    "system_prompt": system_prompt  # Use your existing system prompt
+                },
+                config=config
+            )
+            
+            print(f"🤖 Agent response type: {type(response)}")
+            print(f"📝 Agent response content: {response}")
+            
+            # Extract final answer using enhanced extraction
+            final_response = extract_last_ai_message(response)
+            
+            if final_response and final_response != "No response generated.":
+                print("✅ Traditional agent response successful")
+                return final_response
+            else:
+                print("⚠️ Traditional agent response empty")
+                return "I was unable to generate a proper response. Please try rephrasing your question."
+        
+        except Exception as agent_error:
+            print(f"❌ Traditional agent error: {str(agent_error)}")
+            return f"Error processing your request: {str(agent_error)}"
+    
+    except Exception as e:
+        print(f"❌ Critical error in get_chat_response: {str(e)}")
+        logging.error(f"Critical error in get_chat_response: {str(e)}")
+        return f"A system error occurred while processing your request: {str(e)}"
+
+# Enhanced system initialization function
+def initialize_enhanced_chat_system(autosys_db, llm_instance, traditional_agent):
+    """
+    Initialize the enhanced chat system with both LangGraph and traditional agent support
+    
+    Args:
+        autosys_db: Your AutosysOracleDatabase instance
+        llm_instance: Your LLM instance
+        traditional_agent: Your existing sql_agent
+    
+    Returns:
+        Configured system ready for use
+    """
+    global autosys_langgraph_system, sql_agent, system_prompt
+    
+    try:
+        # Initialize LangGraph system
+        from langgraph_autosys_implementation import create_langgraph_autosys_system
+        autosys_langgraph_system = create_langgraph_autosys_system(autosys_db, llm_instance)
+        print("✅ LangGraph Autosys system initialized")
+    except Exception as e:
+        print(f"⚠️ LangGraph initialization failed: {e}")
+        autosys_langgraph_system = None
+    
+    # Set traditional agent as fallback
+    sql_agent = traditional_agent
+    
+    # Your existing system prompt
+    system_prompt = """
+    You are an expert database assistant for Autosys job scheduling system.
+    Provide accurate, helpful responses about job status, schedules, and performance.
+    Always format responses in a professional, easy-to-read manner.
+    """
+    
+    return {
+        "langgraph_available": autosys_langgraph_system is not None,
+        "traditional_agent_available": sql_agent is not None,
+        "status": "ready"
+    }
+
+# Alternative: Direct LangGraph integration without globals
+def get_chat_response_direct_langgraph(message: str, session_id: str, 
+                                     autosys_system=None, fallback_agent=None) -> str:
+    """
+    Direct LangGraph integration without global variables
+    
+    Args:
+        message: User input
+        session_id: Session identifier
+        autosys_system: LangGraph Autosys system instance
+        fallback_agent: Traditional agent for fallback
+    """
+    try:
+        if not message or not message.strip():
+            return "Please provide a question about the database."
+        
+        message = message.strip()
+        print(f"🔍 Processing: {message}")
+        
+        config = {"configurable": {"thread_id": session_id}}
+        
+        # Try LangGraph first
+        if autosys_system:
+            try:
+                print("🤖 Using LangGraph Autosys System...")
+                
+                langgraph_result = autosys_system.query(message, config)
+                
+                if langgraph_result.get("success", False):
+                    final_response = extract_last_ai_message(langgraph_result)
+                    if final_response and final_response != "No response generated.":
+                        print("✅ LangGraph response successful")
+                        return final_response
+                
+            except Exception as e:
+                print(f"❌ LangGraph error: {e}")
+        
+        # Fallback to traditional agent
+        if fallback_agent:
+            try:
+                print("🔄 Using traditional agent fallback...")
+                
+                response = fallback_agent.invoke({
+                    "input": message,
+                    "system_prompt": system_prompt
+                }, config=config)
+                
+                final_response = extract_last_ai_message(response)
+                if final_response and final_response != "No response generated.":
+                    return final_response
+                    
+            except Exception as e:
+                print(f"❌ Traditional agent error: {e}")
+        
+        return "I was unable to process your request. Please try again or rephrase your question."
+    
+    except Exception as e:
+        logging.error(f"Error in get_chat_response_direct_langgraph: {e}")
+        return f"System error: {str(e)}"
+
+# Usage example for your existing setup
+"""
+# In your main initialization code:
+
+# Your existing setup
+oracle_uri = "oracle+oracledb://***:***@***/service_name=service_name"
+autosys_db = AutosysOracleDatabase(oracle_uri)
+llm = get_llm("langchain")
+sql_agent = initialize_agent(...)  # Your existing agent
+
+# Initialize enhanced system
+system_status = initialize_enhanced_chat_system(autosys_db, llm, sql_agent)
+print(f"System status: {system_status}")
+
+# Now your get_chat_response function will use both systems
+response = get_chat_response("Show me failed ATSYS jobs", "session_123")
+
+# Or use direct approach:
+autosys_langgraph = create_langgraph_autosys_system(autosys_db, llm)
+response = get_chat_response_direct_langgraph(
+    "Show me failed ATSYS jobs", 
+    "session_123",
+    autosys_system=autosys_langgraph,
+    fallback_agent=sql_agent
+)
+"""
+
+# Debug helper function
+def debug_response_extraction(response):
+    """Helper function to debug response extraction issues"""
+    print(f"🔍 Debug Response Type: {type(response)}")
+    print(f"📋 Debug Response Content: {response}")
+    
+    if isinstance(response, dict):
+        print(f"🔑 Available keys: {list(response.keys())}")
+        for key in ['formatted_output', 'answer', 'result', 'content', 'output']:
+            if key in response:
+                print(f"  ✓ {key}: {str(response[key])[:100]}...")
+    
+    extracted = extract_last_ai_message(response)
+    print(f"📤 Extracted result: {extracted[:200]}...")
+    
+    return extracted
+
+    ============
+
+
+
+
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 from typing import TypedDict, Annotated, Dict, Any, List
