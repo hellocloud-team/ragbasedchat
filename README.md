@@ -1,3 +1,570 @@
+from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.memory import MemorySaver
+from typing import TypedDict, Annotated, Dict, Any, List
+import operator
+from langchain.tools import BaseTool
+from pydantic import BaseModel, Field
+import json
+import logging
+from datetime import datetime
+import re
+
+# State definition for LangGraph
+class AutosysState(TypedDict):
+    """State for the Autosys LangGraph workflow"""
+    messages: Annotated[List[Dict[str, str]], operator.add]
+    user_question: str
+    sql_query: str
+    query_results: Dict[str, Any]
+    formatted_output: str
+    error: str
+    iteration_count: int
+
+class AutosysQueryInput(BaseModel):
+    """Input schema for Autosys Query Tool"""
+    question: str = Field(description="Natural language question about Autosys jobs")
+
+class AutosysLLMTool(BaseTool):
+    """LangChain tool for use within LangGraph nodes"""
+    
+    name: str = "AutosysQuery"
+    description: str = """
+    Query Autosys job scheduler database using natural language.
+    Returns structured data for further processing in the graph.
+    """
+    args_schema = AutosysQueryInput
+    
+    def __init__(self, autosys_db, llm_instance, max_results: int = 50):
+        super().__init__()
+        self.autosys_db = autosys_db
+        self.llm = llm_instance
+        self.max_results = max_results
+        self.logger = logging.getLogger(self.__class__.__name__)
+
+    def _run(self, question: str) -> Dict[str, Any]:
+        """Execute query and return structured results"""
+        try:
+            # Generate SQL
+            sql_query = self._generate_sql(question)
+            
+            # Execute query
+            results = self._execute_query(sql_query)
+            
+            return {
+                "success": True,
+                "sql_query": sql_query,
+                "results": results.get("results", []),
+                "row_count": results.get("row_count", 0),
+                "execution_time": results.get("execution_time", 0)
+            }
+            
+        except Exception as e:
+            return {
+                "success": False,
+                "error": str(e),
+                "sql_query": "",
+                "results": [],
+                "row_count": 0,
+                "execution_time": 0
+            }
+
+    def _generate_sql(self, question: str) -> str:
+        """Generate SQL using LLM"""
+        prompt = f"""
+Generate Oracle SQL for Autosys database query.
+
+SCHEMA:
+- aedbadmin.ujo_jobst: job_name, status, last_start, last_end, joid
+- aedbadmin.ujo_job: joid, owner, machine
+- aedbadmin.UJO_INTCODES: code, TEXT
+
+PATTERNS:
+- Time: TO_CHAR(TO_DATE('01.01.1970 19:00:00','DD.MM.YYYY HH24:Mi:Ss') + (last_start / 86400), 'MM/DD/YYYY HH24:Mi:Ss')
+- Joins: js INNER JOIN aedbadmin.ujo_job j ON j.joid = js.joid
+- Status: LEFT JOIN aedbadmin.UJO_INTCODES ic ON js.status = ic.code
+
+Question: {question}
+
+Return only SQL:
+"""
+        
+        response = self.llm.invoke(prompt)
+        sql = response.content if hasattr(response, 'content') else str(response)
+        return self._clean_sql(sql)
+
+    def _clean_sql(self, sql: str) -> str:
+        """Clean SQL response"""
+        sql = re.sub(r'```sql\s*', '', sql, flags=re.IGNORECASE)
+        sql = re.sub(r'```\s*', '', sql)
+        sql = ' '.join(sql.split())
+        
+        if 'ROWNUM' not in sql.upper():
+            if 'WHERE' in sql.upper():
+                sql = sql.replace('WHERE', f'WHERE ROWNUM <= {self.max_results} AND', 1)
+            else:
+                sql += f' WHERE ROWNUM <= {self.max_results}'
+        
+        return sql.strip()
+
+    def _execute_query(self, sql_query: str) -> Dict[str, Any]:
+        """Execute query using existing database"""
+        try:
+            start_time = datetime.now()
+            
+            # Use existing database connection
+            if hasattr(self.autosys_db, 'execute_query'):
+                raw_results = self.autosys_db.execute_query(sql_query)
+            elif hasattr(self.autosys_db, 'run'):
+                raw_results = self.autosys_db.run(sql_query)
+            else:
+                raise Exception("Database method not found")
+            
+            # Convert results to standard format
+            results = self._process_results(raw_results)
+            execution_time = (datetime.now() - start_time).total_seconds()
+            
+            return {
+                "success": True,
+                "results": results,
+                "row_count": len(results),
+                "execution_time": execution_time
+            }
+            
+        except Exception as e:
+            return {
+                "success": False,
+                "error": str(e),
+                "results": [],
+                "row_count": 0,
+                "execution_time": 0
+            }
+
+    def _process_results(self, raw_results) -> List[Dict]:
+        """Convert raw results to standardized format"""
+        if isinstance(raw_results, str):
+            try:
+                import ast
+                if raw_results.startswith('['):
+                    raw_results = ast.literal_eval(raw_results)
+                else:
+                    return [{"result": raw_results}]
+            except:
+                return [{"result": raw_results}]
+        
+        if isinstance(raw_results, list):
+            processed = []
+            for item in raw_results:
+                if isinstance(item, (tuple, list)):
+                    row_dict = {}
+                    col_names = ["JOB_NAME", "START_TIME", "END_TIME", "STATUS", "OWNER"]
+                    for i, value in enumerate(item):
+                        col_name = col_names[i] if i < len(col_names) else f"COL_{i}"
+                        row_dict[col_name] = str(value) if value is not None else ""
+                    processed.append(row_dict)
+                elif isinstance(item, dict):
+                    processed.append(item)
+                else:
+                    processed.append({"VALUE": str(item)})
+            return processed
+        
+        return [{"result": str(raw_results)}]
+
+# LangGraph Implementation
+class AutosysLangGraph:
+    """LangGraph-based Autosys query system"""
+    
+    def __init__(self, autosys_db, llm_instance):
+        self.autosys_db = autosys_db
+        self.llm = llm_instance
+        self.tool = AutosysLLMTool(autosys_db, llm_instance)
+        self.logger = logging.getLogger(self.__class__.__name__)
+        
+        # Create the graph
+        self.graph = self._build_graph()
+
+    def _build_graph(self) -> StateGraph:
+        """Build the LangGraph workflow"""
+        
+        # Create StateGraph
+        workflow = StateGraph(AutosysState)
+        
+        # Add nodes
+        workflow.add_node("understand_query", self.understand_query_node)
+        workflow.add_node("generate_sql", self.generate_sql_node)
+        workflow.add_node("execute_query", self.execute_query_node)
+        workflow.add_node("format_results", self.format_results_node)
+        workflow.add_node("handle_error", self.handle_error_node)
+        
+        # Set entry point
+        workflow.set_entry_point("understand_query")
+        
+        # Add edges
+        workflow.add_edge("understand_query", "generate_sql")
+        workflow.add_conditional_edges(
+            "generate_sql",
+            self._should_execute_query,
+            {
+                "execute": "execute_query",
+                "error": "handle_error"
+            }
+        )
+        workflow.add_conditional_edges(
+            "execute_query", 
+            self._should_format_results,
+            {
+                "format": "format_results",
+                "error": "handle_error"
+            }
+        )
+        workflow.add_edge("format_results", END)
+        workflow.add_edge("handle_error", END)
+        
+        return workflow.compile()
+
+    def understand_query_node(self, state: AutosysState) -> AutosysState:
+        """Analyze and understand the user query"""
+        self.logger.info(f"Understanding query: {state['user_question']}")
+        
+        # Add analysis message
+        state["messages"].append({
+            "role": "system", 
+            "content": f"Analyzing Autosys query: {state['user_question']}"
+        })
+        
+        # Basic query validation and enhancement
+        question = state["user_question"].strip()
+        
+        # Enhance question with context if needed
+        if not any(keyword in question.lower() for keyword in ['atsys', 'job', 'status']):
+            question = f"Show Autosys jobs related to: {question}"
+            state["user_question"] = question
+        
+        return state
+
+    def generate_sql_node(self, state: AutosysState) -> AutosysState:
+        """Generate SQL query using LLM"""
+        try:
+            self.logger.info("Generating SQL query")
+            
+            # Use the tool to generate SQL
+            tool_result = self.tool.run(state["user_question"])
+            
+            if tool_result["success"]:
+                state["sql_query"] = tool_result["sql_query"]
+                state["messages"].append({
+                    "role": "system",
+                    "content": f"Generated SQL query: {tool_result['sql_query'][:100]}..."
+                })
+            else:
+                state["error"] = f"SQL generation failed: {tool_result.get('error', 'Unknown error')}"
+                state["messages"].append({
+                    "role": "system",
+                    "content": f"SQL generation error: {state['error']}"
+                })
+            
+        except Exception as e:
+            state["error"] = f"SQL generation exception: {str(e)}"
+            self.logger.error(f"SQL generation failed: {e}")
+        
+        return state
+
+    def execute_query_node(self, state: AutosysState) -> AutosysState:
+        """Execute the SQL query"""
+        try:
+            self.logger.info("Executing SQL query")
+            
+            # Execute using the tool
+            tool_result = self.tool.run(state["user_question"])
+            
+            if tool_result["success"]:
+                state["query_results"] = {
+                    "success": True,
+                    "results": tool_result["results"],
+                    "row_count": tool_result["row_count"],
+                    "execution_time": tool_result["execution_time"],
+                    "sql_query": tool_result["sql_query"]
+                }
+                state["messages"].append({
+                    "role": "system",
+                    "content": f"Query executed successfully: {tool_result['row_count']} results in {tool_result['execution_time']:.2f}s"
+                })
+            else:
+                state["error"] = f"Query execution failed: {tool_result.get('error', 'Unknown error')}"
+                state["query_results"] = {"success": False, "error": state["error"]}
+                
+        except Exception as e:
+            state["error"] = f"Query execution exception: {str(e)}"
+            state["query_results"] = {"success": False, "error": state["error"]}
+            self.logger.error(f"Query execution failed: {e}")
+        
+        return state
+
+    def format_results_node(self, state: AutosysState) -> AutosysState:
+        """Format results using LLM"""
+        try:
+            self.logger.info("Formatting results")
+            
+            results = state["query_results"]["results"]
+            
+            if not results:
+                state["formatted_output"] = self._create_no_results_html()
+                return state
+            
+            # Format using LLM
+            formatting_prompt = f"""
+Create professional HTML for these Autosys query results:
+
+Question: {state['user_question']}
+Results: {len(results)} jobs found
+Execution Time: {state['query_results'].get('execution_time', 0):.2f}s
+
+Data (first 10 results):
+{json.dumps(results[:10], indent=2, default=str)}
+
+Create responsive HTML with:
+- Professional styling (inline CSS only)
+- Color-coded status badges  
+- Summary statistics
+- Mobile-friendly design
+- Clean, readable format
+
+Return only HTML:
+"""
+            
+            response = self.llm.invoke(formatting_prompt)
+            formatted_html = response.content if hasattr(response, 'content') else str(response)
+            
+            # Add metadata
+            metadata = f"""
+            <div style="margin-top: 15px; padding: 10px; background: #f8f9fa; border-radius: 4px; font-size: 11px; color: #666;">
+                <strong>LangGraph AutosysQuery</strong> • {state['query_results']['row_count']} results • {state['query_results']['execution_time']:.2f}s
+            </div>
+            """
+            
+            state["formatted_output"] = formatted_html + metadata
+            state["messages"].append({
+                "role": "assistant",
+                "content": "Results formatted successfully"
+            })
+            
+        except Exception as e:
+            state["error"] = f"Formatting failed: {str(e)}"
+            state["formatted_output"] = self._create_error_html(state["error"])
+            self.logger.error(f"Formatting failed: {e}")
+        
+        return state
+
+    def handle_error_node(self, state: AutosysState) -> AutosysState:
+        """Handle errors and provide user-friendly error messages"""
+        self.logger.error(f"Handling error: {state.get('error', 'Unknown error')}")
+        
+        error_msg = state.get("error", "An unknown error occurred")
+        sql_query = state.get("sql_query", "")
+        
+        state["formatted_output"] = self._create_error_html(error_msg, sql_query)
+        state["messages"].append({
+            "role": "system",
+            "content": f"Error handled: {error_msg}"
+        })
+        
+        return state
+
+    def _should_execute_query(self, state: AutosysState) -> str:
+        """Conditional edge: decide whether to execute query or handle error"""
+        if state.get("error"):
+            return "error"
+        elif state.get("sql_query"):
+            return "execute"
+        else:
+            return "error"
+
+    def _should_format_results(self, state: AutosysState) -> str:
+        """Conditional edge: decide whether to format results or handle error"""
+        if state.get("error"):
+            return "error"
+        elif state.get("query_results", {}).get("success"):
+            return "format"
+        else:
+            return "error"
+
+    def _create_no_results_html(self) -> str:
+        """HTML for no results found"""
+        return """
+        <div style="padding: 20px; background: #fff3cd; border: 1px solid #ffeaa7; border-radius: 5px;">
+            <h4 style="margin: 0 0 10px 0; color: #856404;">No Results Found</h4>
+            <p style="margin: 0; color: #856404;">No Autosys jobs match your query criteria. Try rephrasing your question or checking job names.</p>
+        </div>
+        """
+
+    def _create_error_html(self, error_msg: str, sql_query: str = "") -> str:
+        """HTML for error display"""
+        html = f"""
+        <div style="border: 1px solid #dc3545; background: #f8d7da; color: #721c24; padding: 15px; border-radius: 5px;">
+            <h4 style="margin: 0 0 10px 0;">LangGraph AutosysQuery Error</h4>
+            <p style="margin: 0;"><strong>Error:</strong> {error_msg}</p>
+        """
+        
+        if sql_query:
+            html += f"""
+            <details style="margin-top: 10px;">
+                <summary style="cursor: pointer;">View Generated SQL</summary>
+                <pre style="background: #e9ecef; padding: 10px; margin-top: 5px; border-radius: 3px; font-size: 11px; overflow-x: auto;">{sql_query}</pre>
+            </details>
+            """
+        
+        html += "</div>"
+        return html
+
+    def query(self, user_question: str, config: Dict = None) -> Dict[str, Any]:
+        """Main method to process a query"""
+        
+        # Initialize state
+        initial_state = {
+            "messages": [],
+            "user_question": user_question,
+            "sql_query": "",
+            "query_results": {},
+            "formatted_output": "",
+            "error": "",
+            "iteration_count": 0
+        }
+        
+        # Execute the graph
+        try:
+            final_state = self.graph.invoke(initial_state, config=config)
+            
+            return {
+                "success": not bool(final_state.get("error")),
+                "formatted_output": final_state.get("formatted_output", ""),
+                "sql_query": final_state.get("sql_query", ""),
+                "row_count": final_state.get("query_results", {}).get("row_count", 0),
+                "execution_time": final_state.get("query_results", {}).get("execution_time", 0),
+                "error": final_state.get("error", ""),
+                "messages": final_state.get("messages", [])
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Graph execution failed: {e}")
+            return {
+                "success": False,
+                "formatted_output": self._create_error_html(f"Graph execution failed: {str(e)}"),
+                "error": str(e),
+                "messages": []
+            }
+
+# Integration function
+def create_langgraph_autosys_system(autosys_db, llm_instance):
+    """
+    Create LangGraph-based Autosys system
+    
+    Args:
+        autosys_db: Your AutosysOracleDatabase instance
+        llm_instance: Your LLM instance from get_llm("langchain")
+    
+    Returns:
+        AutosysLangGraph instance
+    """
+    return AutosysLangGraph(autosys_db, llm_instance)
+
+# Usage example
+def setup_langgraph_autosys():
+    """Complete setup example"""
+    
+    # Your existing setup
+    oracle_uri = "oracle+oracledb://***:***@***/service_name=service_name"
+    autosys_db = AutosysOracleDatabase(oracle_uri)
+    llm = get_llm("langchain")
+    
+    # Create LangGraph system
+    autosys_system = create_langgraph_autosys_system(autosys_db, llm)
+    
+    # Optional: Add memory/persistence
+    memory = MemorySaver()
+    
+    # Use the system
+    def process_autosys_query(user_question: str, thread_id: str = "default"):
+        config = {"configurable": {"thread_id": thread_id}}
+        result = autosys_system.query(user_question, config)
+        
+        if result["success"]:
+            return result["formatted_output"]
+        else:
+            return f"Error: {result['error']}"
+    
+    return process_autosys_query
+
+# Advanced usage with streaming
+def setup_streaming_langgraph():
+    """Setup with streaming support"""
+    
+    # Your existing components
+    autosys_db = AutosysOracleDatabase(oracle_uri)
+    llm = get_llm("langchain")
+    
+    # Create system
+    autosys_system = create_langgraph_autosys_system(autosys_db, llm)
+    
+    def stream_autosys_query(user_question: str):
+        """Stream the execution process"""
+        initial_state = {
+            "messages": [],
+            "user_question": user_question,
+            "sql_query": "",
+            "query_results": {},
+            "formatted_output": "",
+            "error": "",
+            "iteration_count": 0
+        }
+        
+        # Stream execution
+        for step in autosys_system.graph.stream(initial_state):
+            node_name = list(step.keys())[0]
+            node_state = step[node_name]
+            
+            yield {
+                "step": node_name,
+                "status": "error" if node_state.get("error") else "success",
+                "message": f"Completed: {node_name}",
+                "data": node_state
+            }
+        
+        # Final result
+        yield {
+            "step": "complete",
+            "status": "success" if not node_state.get("error") else "error", 
+            "formatted_output": node_state.get("formatted_output", ""),
+            "final": True
+        }
+    
+    return stream_autosys_query
+
+"""
+Complete usage example:
+
+# Replace your existing agent with LangGraph:
+
+# Old way:
+sql_agent = initialize_agent(tools=tools, llm=llm, ...)
+
+# New way:
+autosys_system = create_langgraph_autosys_system(autosys_db, llm)
+
+# Process queries:
+result = autosys_system.query("Show me failed ATSYS jobs today")
+print(result["formatted_output"])
+
+# With streaming:
+stream_func = setup_streaming_langgraph()
+for step in stream_func("Which jobs are running?"):
+    print(f"Step: {step['step']}, Status: {step['status']}")
+    if step.get("final"):
+        print(step["formatted_output"])
+"""
+
+
+
+
+-------
 from langchain.tools import BaseTool
 from typing import Dict, Any, Optional, List
 import json
