@@ -1,3 +1,60 @@
+The Fix:Looking at your route_message_node, the logic has a flaw. Here's the corrected version:def route_message_node(self, state: AutosysState) -> AutosysState:
+    """Route message to appropriate handler"""
+    
+    message = state["user_question"].strip().lower()
+    
+    # First check for explicit casual greetings - these should ALWAYS go to conversation
+    casual_inputs = [
+        "hi", "hello", "hey", "how are you", "good morning", "good evening",
+        "what's up", "how's it going", "yo", "greetings"
+    ]
+    
+    # Prioritize casual messages - if it's a greeting, it's conversation
+    if any(casual_word in message for casual_word in casual_inputs):
+        is_conversation = True
+        logger.info("Detected casual input - routing to conversation")
+    else:
+        # Only then check for Autosys keywords
+        is_conversation = not is_autosys_related_query(state["user_question"])
+        logger.info(f"Autosys check result - routing to: {'conversation' if is_conversation else 'database query'}")
+    
+    state["is_general_conversation"] = is_conversation
+    
+    state["messages"].append({
+        "role": "system",
+        "content": f"Routing to: {'conversation' if is_conversation else 'database query'}"
+    })
+    
+    return stateAlternative: Modify your is_autosys_related_query functionAdd this check at the beginning of your is_autosys_related_query function:def is_autosys_related_query(message: str) -> bool:
+    """Determine if the message requires Autosys database query"""
+    
+    # FIRST: Check for casual inputs - these are NEVER Autosys queries
+    casual_inputs = [
+        "hi", "hello", "hey", "how are you", "good morning", "good evening",
+        "what's up", "how's it going", "yo", "greetings", "thanks", "thank you"
+    ]
+    
+    message_lower = message.lower().strip()
+    
+    # If it's a casual message, return False immediately
+    if any(casual_word in message_lower for casual_word in casual_inputs):
+        logger.info("Detected casual input - NOT routing to database")
+        return False
+    
+    # Rest of your existing logic...
+    autosys_keywords = [
+        'job', 'jobs', 'atsys', 'autosys', 'schedule', 'status', 'failed', 'failure',
+        'running', 'success', 'database', 'query', 'select', 'show', 'list', 'find',
+        'search', 'owner', 'machine', 'execution', 'sql', 'table', 'count', 'report'
+    ]
+    
+    # ... continue with existing logicQuick Debug:Add this debug line in your get_chat_response function to see what's happening:def get_chat_response(message: str, session_id: str, autosys_system=None) -> str:
+    # Add this debug line
+    is_db_query = is_autosys_related_query(message)
+    logger.info(f"Message: '{message}' -> Database query: {is_db_query}")
+    
+    # Continue with your existing code...The issue is that your routing logic isn't properly prioritizing casual inputs over the general Autosys keyword detection. The fix ensures that greetings like "hi" are immediately identified as conversation and never get processed as database queries.
+&&&&&&&&&&&&&&&
 # ============================================================================
 # CLEAN LANGGRAPH AUTOSYS IMPLEMENTATION - NEW WAY ONLY
 # ============================================================================
