@@ -1,3 +1,53 @@
+
+def handle_conversation_node(self, state: AutosysState) -> AutosysState:
+    """Handle general conversation using LLM"""
+    
+    try:
+        conversation_prompt = f"""
+You are a helpful AI assistant for an Autosys database system.
+
+You excel at both friendly conversation and database queries. For this message, respond naturally to the general conversation.
+
+Your capabilities:
+- Natural conversation about any topic
+- Query Autosys job scheduler database
+- Provide job status, schedules, and reports
+
+User message: "{state['user_question']}"
+
+Respond in a friendly, professional manner:
+"""
+        
+        response = self.llm.invoke(conversation_prompt)
+        content = response.content if hasattr(response, 'content') else str(response)
+        
+        # Clean chat bubble styling like the image
+        state["formatted_output"] = f"""
+        <div style="display: flex; justify-content: flex-start; margin: 10px 0;">
+            <div style="max-width: 70%; background: #e9ecef; border-radius: 18px; padding: 12px 16px; color: #212529; font-size: 14px; line-height: 1.4; box-shadow: 0 1px 2px rgba(0,0,0,0.1);">
+                {content}
+            </div>
+        </div>
+        """
+        
+    except Exception as e:
+        # Fallback response with same styling
+        state["formatted_output"] = f"""
+        <div style="display: flex; justify-content: flex-start; margin: 10px 0;">
+            <div style="max-width: 70%; background: #e9ecef; border-radius: 18px; padding: 12px 16px; color: #212529; font-size: 14px; line-height: 1.4;">
+                Hi there! How can I help you today?
+            </div>
+        </div>
+        """
+    
+    return state
+
+
+
+
+
+
+
 Here's the fix for your
 
 
