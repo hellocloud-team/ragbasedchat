@@ -1,3 +1,65 @@
+Here's the fix for your
+
+
+handle_conversation_node function:
+
+def handle_conversation_node(self, state: AutosysState) -> AutosysState:
+    """Handle general conversation using LLM"""
+    
+    try:
+        conversation_prompt = f"""
+You are a helpful AI assistant for an Autosys database system.
+
+You excel at both friendly conversation and database queries. For this message, respond naturally to the general conversation.
+
+Your capabilities:
+- Natural conversation about any topic
+- Query Autosys job scheduler database
+- Provide job status, schedules, and reports
+
+User message: "{state['user_question']}"
+
+Respond in a friendly, professional manner:
+"""
+        
+        response = self.llm.invoke(conversation_prompt)
+        content = response.content if hasattr(response, 'content') else str(response)
+        
+        # Fixed styling - inline-block and max-width for content-based sizing
+        state["formatted_output"] = f"""
+        <div style="display: inline-block; max-width: 80%; background: #f1f3f5; border-radius: 8px; border-left: 4px solid #28a745; margin: 10px 0; padding: 12px 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.1);">
+            <div style="display: flex; align-items: center; margin-bottom: 6px;">
+                <span style="font-size: 14px; margin-right: 6px; color: #28a745;">💬</span>
+                <span style="font-weight: 500; color: #495057; font-size: 13px;">Assistant</span>
+            </div>
+            <p style="margin: 0; color: #212529; line-height: 1.5; font-size: 14px;">{content}</p>
+            <div style="margin-top: 8px; padding-top: 6px; border-top: 1px solid #dee2e6; font-size: 10px; color: #6c757d;">
+                <em>General conversation • Ask about Autosys jobs for database queries</em>
+            </div>
+        </div>
+        """
+        
+    except Exception as e:
+        # Compact fallback response
+        state["formatted_output"] = f"""
+        <div style="display: inline-block; max-width: 70%; background: #f1f3f5; border-radius: 8px; border-left: 4px solid #28a745; padding: 12px; margin: 10px 0;">
+            <p style="margin: 0; color: #212529; font-size: 14px;">Hello! I'm here to help with both general questions and Autosys database queries. How can I assist you today?</p>
+            <div style="margin-top: 6px; font-size: 10px; color: #6c757d;">
+                <em>General conversation mode</em>
+            </div>
+        </div>
+        """
+    
+    return state
+
+
+
+
+
+
+
+"""""""
+
 The Fix:Looking at your route_message_node, the logic has a flaw. Here's the corrected version:def route_message_node(self, state: AutosysState) -> AutosysState:
     """Route message to appropriate handler"""
     
