@@ -1,4 +1,1052 @@
+# ============================================================================
+# LLM-DRIVEN MULTI-DATABASE AUTOSYS SYSTEM - FULLY AI-POWERED
+# ============================================================================
 
+import oracledb
+import json
+import logging
+import re
+from typing import Dict, Any, Optional, List, TypedDict, Annotated
+from datetime import datetime
+from pydantic import BaseModel, Field
+import operator
+
+# LangGraph imports
+from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.memory import MemorySaver
+
+# LangChain imports (minimal, for tool compatibility only)
+from langchain.tools import BaseTool
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ============================================================================
+# ENHANCED STATE FOR LLM-DRIVEN SYSTEM
+# ============================================================================
+
+class AutosysState(TypedDict):
+    """State for LLM-driven multi-database Autosys workflow"""
+    messages: Annotated[List[Dict[str, str]], operator.add]
+    user_question: str
+    llm_analysis: Dict[str, Any]  # LLM's complete analysis
+    is_general_conversation: bool
+    extracted_instance: str
+    extracted_job_name: str
+    extracted_calendar_name: str
+    missing_parameters: List[str]  # LLM-determined missing params
+    query_type: str
+    sql_query: str
+    query_results: Dict[str, Any]
+    formatted_output: str
+    error: str
+    session_id: str
+
+# ============================================================================
+# DATABASE MANAGER (Keep existing implementation)
+# ============================================================================
+
+class DatabaseInstance:
+    """Represents a single database instance"""
+    def __init__(self, instance_name: str, autosys_db, description: str = ""):
+        self.instance_name = instance_name
+        self.autosys_db = autosys_db
+        self.description = description
+        self.is_connected = self._test_connection()
+    
+    def _test_connection(self) -> bool:
+        """Test if database connection is available"""
+        try:
+            if hasattr(self.autosys_db, 'connection') and self.autosys_db.connection:
+                return True
+            return False
+        except:
+            return False
+
+class DatabaseManager:
+    """Manages multiple database instances"""
+    def __init__(self):
+        self.instances: Dict[str, DatabaseInstance] = {}
+        self.logger = logging.getLogger(self.__class__.__name__)
+    
+    def add_instance(self, instance_name: str, autosys_db, description: str = ""):
+        """Add a database instance"""
+        instance = DatabaseInstance(instance_name, autosys_db, description)
+        self.instances[instance_name.upper()] = instance
+        self.logger.info(f"Added database instance: {instance_name}")
+        return instance
+    
+    def get_instance(self, instance_name: str) -> Optional[DatabaseInstance]:
+        """Get database instance by name"""
+        return self.instances.get(instance_name.upper())
+    
+    def list_instances(self) -> List[str]:
+        """List all available instances"""
+        return [name for name, instance in self.instances.items() if instance.is_connected]
+    
+    def get_instance_info(self) -> str:
+        """Get formatted instance information"""
+        if not self.instances:
+            return "No database instances configured."
+        
+        info_lines = []
+        for name, instance in self.instances.items():
+            status = "Connected" if instance.is_connected else "Disconnected"
+            desc = f" - {instance.description}" if instance.description else ""
+            info_lines.append(f"{name}: {status}{desc}")
+        
+        return "\n".join(info_lines)
+
+# ============================================================================
+# FULLY LLM-DRIVEN AUTOSYS SYSTEM
+# ============================================================================
+
+class LLMDrivenAutosysSystem:
+    """Completely LLM-driven system for Autosys queries"""
+    
+    def __init__(self, db_manager: DatabaseManager, llm_instance):
+        self.db_manager = db_manager
+        self.llm = llm_instance
+        self.memory = MemorySaver()
+        self.logger = logging.getLogger(self.__class__.__name__)
+        
+        # Build workflow
+        self.graph = self._build_graph()
+
+    def _build_graph(self) -> StateGraph:
+        """Build the LLM-driven workflow"""
+        
+        workflow = StateGraph(AutosysState)
+        
+        # Add nodes - all driven by LLM
+        workflow.add_node("analyze_with_llm", self.analyze_with_llm_node)
+        workflow.add_node("handle_conversation", self.handle_conversation_node)
+        workflow.add_node("extract_parameters_llm", self.extract_parameters_llm_node)
+        workflow.add_node("request_missing_params_llm", self.request_missing_params_llm_node)
+        workflow.add_node("generate_sql_llm", self.generate_sql_llm_node)
+        workflow.add_node("execute_query", self.execute_query_node)
+        workflow.add_node("format_results_llm", self.format_results_llm_node)
+        workflow.add_node("handle_error_llm", self.handle_error_llm_node)
+        
+        # Set entry point
+        workflow.set_entry_point("analyze_with_llm")
+        
+        # Add conditional routing - decisions made by LLM
+        workflow.add_conditional_edges(
+            "analyze_with_llm",
+            self._llm_routing_decision,
+            {
+                "conversation": "handle_conversation",
+                "database": "extract_parameters_llm"
+            }
+        )
+        
+        workflow.add_edge("handle_conversation", END)
+        
+        workflow.add_conditional_edges(
+            "extract_parameters_llm", 
+            self._llm_parameter_check,
+            {
+                "needs_params": "request_missing_params_llm",
+                "has_all_params": "generate_sql_llm"
+            }
+        )
+        
+        workflow.add_edge("request_missing_params_llm", END)
+        
+        workflow.add_conditional_edges(
+            "generate_sql_llm",
+            self._llm_execution_check,
+            {
+                "execute": "execute_query",
+                "error": "handle_error_llm"
+            }
+        )
+        
+        workflow.add_conditional_edges(
+            "execute_query",
+            self._llm_result_check,
+            {
+                "format": "format_results_llm",
+                "error": "handle_error_llm"
+            }
+        )
+        
+        workflow.add_edge("format_results_llm", END)
+        workflow.add_edge("handle_error_llm", END)
+        
+        return workflow.compile(checkpointer=self.memory)
+
+    def analyze_with_llm_node(self, state: AutosysState) -> AutosysState:
+        """Complete LLM-driven analysis of user intent and requirements"""
+        
+        try:
+            available_instances = self.db_manager.list_instances()
+            instance_info = self.db_manager.get_instance_info()
+            
+            analysis_prompt = f"""
+You are an expert Autosys database assistant. Analyze this user message comprehensively.
+
+USER MESSAGE: "{state['user_question']}"
+AVAILABLE DATABASE INSTANCES: {', '.join(available_instances)}
+INSTANCE DETAILS:
+{instance_info}
+
+ANALYZE THE MESSAGE FOR:
+1. Intent Classification:
+   - Is this general conversation (greetings, thanks, casual chat)?
+   - Is this an Autosys database query?
+   - What specific type of query (job details, calendar details, status check, list operations)?
+
+2. Parameter Requirements:
+   - Does this query require a specific job name?
+   - Does this query require a specific calendar name?
+   - Does this query require a database instance?
+   - What parameters are missing that are essential for the query?
+
+3. Extraction Analysis:
+   - What job names, calendar names, or instance names can be extracted?
+   - How confident are you in each extraction?
+   - What fuzzy matches might apply for instances?
+
+4. Query Complexity:
+   - Is this a simple status check, detailed analysis, or complex reporting?
+   - What database tables would be involved?
+
+Provide your analysis in this exact JSON format:
+{{
+    "is_general_conversation": boolean,
+    "query_type": "conversation|job_details|calendar_details|job_status|job_list|general_query",
+    "confidence_level": "high|medium|low",
+    "requires_job_name": boolean,
+    "requires_calendar_name": boolean,
+    "requires_instance": boolean,
+    "extracted_instance": "instance_name_or_null",
+    "extracted_job_name": "job_name_or_null",
+    "extracted_calendar_name": "calendar_name_or_null",
+    "missing_parameters": ["list", "of", "required", "missing", "params"],
+    "user_intent_summary": "brief description of what user wants",
+    "recommended_action": "conversation|parameter_collection|direct_query",
+    "reasoning": "explanation of your analysis"
+}}
+
+Be thorough and accurate in your analysis. Consider context, implied requirements, and user expectations.
+"""
+            
+            response = self.llm.invoke(analysis_prompt)
+            content = response.content if hasattr(response, 'content') else str(response)
+            
+            # Parse LLM analysis
+            try:
+                json_match = re.search(r'\{.*\}', content, re.DOTALL)
+                if json_match:
+                    analysis = json.loads(json_match.group())
+                    
+                    # Store complete LLM analysis
+                    state["llm_analysis"] = analysis
+                    
+                    # Set state based on LLM decisions
+                    state["is_general_conversation"] = analysis.get("is_general_conversation", False)
+                    state["query_type"] = analysis.get("query_type", "general_query")
+                    state["extracted_instance"] = analysis.get("extracted_instance", "") or ""
+                    state["extracted_job_name"] = analysis.get("extracted_job_name", "") or ""
+                    state["extracted_calendar_name"] = analysis.get("extracted_calendar_name", "") or ""
+                    state["missing_parameters"] = analysis.get("missing_parameters", [])
+                    
+                    self.logger.info(f"LLM Analysis: {analysis.get('user_intent_summary', 'Unknown intent')}")
+                    self.logger.info(f"Recommended Action: {analysis.get('recommended_action', 'Unknown')}")
+                    
+                else:
+                    # Fallback if JSON parsing fails
+                    state["llm_analysis"] = {"error": "Failed to parse LLM response"}
+                    state["is_general_conversation"] = "conversation" in content.lower()
+                    
+            except json.JSONDecodeError as e:
+                self.logger.error(f"LLM analysis JSON parsing failed: {e}")
+                state["llm_analysis"] = {"error": f"JSON parsing failed: {str(e)}"}
+                state["is_general_conversation"] = True  # Safe fallback
+                
+        except Exception as e:
+            self.logger.error(f"LLM analysis failed: {str(e)}")
+            state["error"] = f"Analysis failed: {str(e)}"
+            state["llm_analysis"] = {"error": str(e)}
+            state["is_general_conversation"] = True
+        
+        return state
+
+    def handle_conversation_node(self, state: AutosysState) -> AutosysState:
+        """LLM-driven conversation handling"""
+        try:
+            conversation_prompt = f"""
+You are a helpful AI assistant for a multi-database Autosys job scheduling system.
+
+CONTEXT:
+- User message: "{state['user_question']}"
+- Available database instances: {', '.join(self.db_manager.list_instances())}
+- System capabilities: Query job details, calendar information, status checks across multiple database environments
+
+INSTRUCTIONS:
+- Respond naturally and professionally to the user's message
+- If they're greeting you, greet them back warmly
+- If they ask about capabilities, explain you can help with Autosys job and calendar queries across multiple database instances
+- If they ask about available instances, mention the ones available
+- Keep responses conversational but informative
+- Don't use bullet points or formal lists in casual conversation
+
+Provide a friendly, helpful response:
+"""
+            
+            response = self.llm.invoke(conversation_prompt)
+            content = response.content if hasattr(response, 'content') else str(response)
+            
+            state["formatted_output"] = f"""
+            <div style="display: flex; justify-content: flex-start; margin: 10px 0;">
+                <div style="max-width: 70%; background: #e9ecef; border-radius: 18px; padding: 12px 16px; color: #212529; font-size: 14px; line-height: 1.4; box-shadow: 0 1px 2px rgba(0,0,0,0.1);">
+                    {content}
+                </div>
+            </div>
+            """
+            
+        except Exception as e:
+            state["formatted_output"] = f"""
+            <div style="display: flex; justify-content: flex-start; margin: 10px 0;">
+                <div style="max-width: 70%; background: #e9ecef; border-radius: 18px; padding: 12px 16px; color: #212529; font-size: 14px; line-height: 1.4;">
+                    Hi! I can help you query Autosys job and calendar information across multiple database instances. How can I assist you today?
+                </div>
+            </div>
+            """
+        
+        return state
+
+    def extract_parameters_llm_node(self, state: AutosysState) -> AutosysState:
+        """LLM-driven parameter extraction and validation"""
+        
+        try:
+            available_instances = self.db_manager.list_instances()
+            
+            extraction_prompt = f"""
+You are an expert at extracting and validating Autosys database parameters.
+
+CONTEXT:
+- User Query: "{state['user_question']}"
+- Previous Analysis: {json.dumps(state.get('llm_analysis', {}), indent=2)}
+- Available Database Instances: {', '.join(available_instances)}
+
+TASKS:
+1. EXTRACT PARAMETERS with high precision:
+   - Database instance names (validate against available instances)
+   - Specific job names (look for job identifier patterns)
+   - Calendar names (look for calendar identifiers)
+
+2. VALIDATE EXTRACTIONS:
+   - Check if extracted instance exists in available instances
+   - Apply fuzzy matching for instance names (PROD/production, DEV/development, etc.)
+   - Assess confidence levels for each extraction
+
+3. IDENTIFY MISSING REQUIREMENTS:
+   - Based on the query type, what parameters are absolutely required?
+   - What information is missing that would prevent a successful query?
+
+4. PROVIDE RECOMMENDATIONS:
+   - Should we proceed with current parameters?
+   - What clarification is needed from the user?
+
+Return your analysis in JSON format:
+{{
+    "validated_instance": "final_instance_name_or_null",
+    "validated_job_name": "final_job_name_or_null", 
+    "validated_calendar_name": "final_calendar_name_or_null",
+    "instance_confidence": "high|medium|low|none",
+    "job_confidence": "high|medium|low|none",
+    "calendar_confidence": "high|medium|low|none",
+    "missing_critical_params": ["list", "of", "missing", "required", "parameters"],
+    "can_proceed": boolean,
+    "fuzzy_matches_applied": ["list", "of", "any", "fuzzy", "matches", "made"],
+    "validation_notes": "explanation of validation decisions",
+    "recommendation": "proceed|request_clarification|error"
+}}
+
+Be thorough in validation and conservative in confidence assessment.
+"""
+            
+            response = self.llm.invoke(extraction_prompt)
+            content = response.content if hasattr(response, 'content') else str(response)
+            
+            # Parse validation results
+            try:
+                json_match = re.search(r'\{.*\}', content, re.DOTALL)
+                if json_match:
+                    validation = json.loads(json_match.group())
+                    
+                    # Update state with validated parameters
+                    state["extracted_instance"] = validation.get("validated_instance", "") or ""
+                    state["extracted_job_name"] = validation.get("validated_job_name", "") or ""
+                    state["extracted_calendar_name"] = validation.get("validated_calendar_name", "") or ""
+                    state["missing_parameters"] = validation.get("missing_critical_params", [])
+                    
+                    # Log validation results
+                    self.logger.info(f"Parameter validation: Instance={state['extracted_instance']}, Job={state['extracted_job_name']}, Calendar={state['extracted_calendar_name']}")
+                    self.logger.info(f"Missing parameters: {state['missing_parameters']}")
+                    
+                    # Store validation details for later use
+                    state["llm_analysis"]["validation"] = validation
+                    
+            except json.JSONDecodeError as e:
+                self.logger.error(f"Parameter validation parsing failed: {e}")
+                state["missing_parameters"] = ["validation_failed"]
+                
+        except Exception as e:
+            self.logger.error(f"LLM parameter extraction failed: {str(e)}")
+            state["error"] = f"Parameter extraction failed: {str(e)}"
+        
+        return state
+
+    def request_missing_params_llm_node(self, state: AutosysState) -> AutosysState:
+        """LLM-generated clarification requests"""
+        
+        try:
+            available_instances = self.db_manager.list_instances()
+            instance_info = self.db_manager.get_instance_info()
+            
+            clarification_prompt = f"""
+Generate a professional clarification request for missing Autosys parameters.
+
+CONTEXT:
+- Original User Query: "{state['user_question']}"
+- Query Type: {state.get('query_type', 'unknown')}
+- Missing Parameters: {state.get('missing_parameters', [])}
+- Available Instances: {', '.join(available_instances)}
+- LLM Analysis: {json.dumps(state.get('llm_analysis', {}), indent=2)}
+
+REQUIREMENTS:
+1. Create a professional, helpful clarification message
+2. Explain clearly what information is needed and why
+3. Provide 3-4 specific examples based on the user's original intent
+4. Include available instance information
+5. Use encouraging, supportive tone
+6. Format as HTML with good visual design
+
+INSTANCE INFORMATION:
+{instance_info}
+
+Generate an HTML clarification message that:
+- Has a clear title indicating what's needed
+- Explains the requirement in context of their original query
+- Shows available database instances in a formatted way
+- Provides realistic examples
+- Uses professional styling with colors and spacing
+- Encourages the user to provide the missing information
+
+Return only the HTML:
+"""
+            
+            response = self.llm.invoke(clarification_prompt)
+            content = response.content if hasattr(response, 'content') else str(response)
+            
+            # Clean up HTML if wrapped in markdown
+            content = re.sub(r'```html\s*', '', content, flags=re.IGNORECASE)
+            content = re.sub(r'```\s*$', '', content)
+            
+            state["formatted_output"] = content
+            
+        except Exception as e:
+            # Fallback clarification if LLM fails
+            missing_params_str = ", ".join(state.get("missing_parameters", ["required information"]))
+            state["formatted_output"] = f"""
+            <div style="background: #fff3cd; border: 1px solid #ffeaa7; border-radius: 8px; padding: 15px; margin: 10px 0;">
+                <h4 style="margin: 0 0 10px 0; color: #856404;">Additional Information Required</h4>
+                <p style="margin: 0 0 15px 0; color: #856404;">
+                    To process your request "{state['user_question']}", I need: {missing_params_str}
+                </p>
+                <div style="background: #f8f9fa; border-radius: 4px; padding: 10px;">
+                    <strong>Available Instances:</strong><br>
+                    {self.db_manager.get_instance_info()}
+                </div>
+            </div>
+            """
+        
+        return state
+
+    def generate_sql_llm_node(self, state: AutosysState) -> AutosysState:
+        """LLM-driven SQL generation"""
+        
+        try:
+            sql_generation_prompt = f"""
+Generate optimized Oracle SQL for Autosys database query using advanced query construction.
+
+CONTEXT:
+- User Query: "{state['user_question']}"
+- Query Type: {state.get('query_type', 'general')}
+- Database Instance: {state.get('extracted_instance', 'Unknown')}
+- Job Name: {state.get('extracted_job_name', 'None')}
+- Calendar Name: {state.get('extracted_calendar_name', 'None')}
+- LLM Analysis: {json.dumps(state.get('llm_analysis', {}), indent=2)}
+
+AUTOSYS SCHEMA:
+- aedbadmin.ujo_jobst: Main job status table (job_name, status, last_start, last_end, joid)
+- aedbadmin.ujo_job: Job definition table (joid, owner, machine, job_type, description)
+- aedbadmin.UJO_INTCODES: Status code lookup (code, TEXT)
+
+STATUS CODES:
+- 4 = SUCCESS, 7 = FAILURE, 8 = RUNNING, 1 = INACTIVE, 9 = TERMINATED
+
+TIME CONVERSION:
+- Autosys timestamps are epoch seconds: TO_CHAR(TO_DATE('01.01.1970 19:00:00','DD.MM.YYYY HH24:Mi:Ss') + (last_start / 86400), 'MM/DD/YYYY HH24:Mi:Ss')
+
+SQL CONSTRUCTION RULES:
+1. Always include proper JOINs between tables
+2. Use status code translation: LEFT JOIN aedbadmin.UJO_INTCODES ic ON js.status = ic.code
+3. Apply appropriate WHERE clauses based on parameters
+4. Include time-based filters for recent queries
+5. Limit results with ROWNUM <= 50
+6. Order by relevance (status, then time)
+
+QUERY TYPES:
+- job_details: Focus on specific job with comprehensive information
+- calendar_details: Focus on calendar-related jobs and schedules
+- job_status: Current status information for jobs
+- job_list: List of jobs matching criteria
+- general_query: Broad query based on user intent
+
+Generate the complete, optimized SQL query. Return only the SQL:
+"""
+            
+            response = self.llm.invoke(sql_generation_prompt)
+            sql_content = response.content if hasattr(response, 'content') else str(response)
+            
+            # Clean SQL
+            sql_content = re.sub(r'```sql\s*', '', sql_content, flags=re.IGNORECASE)
+            sql_content = re.sub(r'```\s*$', '', sql_content)
+            sql_content = ' '.join(sql_content.split()).strip()
+            
+            state["sql_query"] = sql_content
+            
+            self.logger.info(f"Generated SQL for {state.get('query_type', 'query')}: {len(sql_content)} characters")
+            
+        except Exception as e:
+            state["error"] = f"SQL generation failed: {str(e)}"
+            self.logger.error(f"LLM SQL generation failed: {e}")
+        
+        return state
+
+    def execute_query_node(self, state: AutosysState) -> AutosysState:
+        """Execute database query (same as before)"""
+        try:
+            instance_name = state.get("extracted_instance")
+            sql_query = state.get("sql_query")
+            
+            if not instance_name or not sql_query:
+                state["error"] = "Missing instance name or SQL query"
+                return state
+            
+            # Get database instance
+            instance = self.db_manager.get_instance(instance_name)
+            if not instance:
+                state["error"] = f"Database instance '{instance_name}' not found"
+                return state
+            
+            # Execute query
+            start_time = datetime.now()
+            
+            if hasattr(instance.autosys_db, 'run'):
+                raw_results = instance.autosys_db.run(sql_query)
+            else:
+                raise Exception(f"Database connection method not found for instance {instance_name}")
+            
+            execution_time = (datetime.now() - start_time).total_seconds()
+            
+            # Process results
+            processed_results = self._process_results(raw_results)
+            
+            state["query_results"] = {
+                "success": True,
+                "results": processed_results,
+                "row_count": len(processed_results),
+                "execution_time": execution_time,
+                "instance_used": instance_name
+            }
+            
+        except Exception as e:
+            state["error"] = f"Query execution failed: {str(e)}"
+            state["query_results"] = {"success": False}
+        
+        return state
+
+    def _process_results(self, raw_results) -> List[Dict]:
+        """Convert raw database results to standardized format"""
+        if isinstance(raw_results, str):
+            try:
+                import ast
+                if raw_results.startswith('[') and raw_results.endswith(']'):
+                    return self._convert_tuples_to_dicts(ast.literal_eval(raw_results))
+                else:
+                    return [{"result": raw_results}]
+            except:
+                return [{"result": raw_results}]
+        elif isinstance(raw_results, list):
+            return self._convert_tuples_to_dicts(raw_results)
+        else:
+            return [{"result": str(raw_results)}]
+
+    def _convert_tuples_to_dicts(self, raw_results: List) -> List[Dict]:
+        """Convert list of tuples to list of dictionaries"""
+        results = []
+        column_names = ["JOB_NAME", "START_TIME", "END_TIME", "STATUS", "OWNER", "MACHINE"]
+        
+        for item in raw_results:
+            if isinstance(item, (tuple, list)):
+                row_dict = {}
+                for i, value in enumerate(item):
+                    col_name = column_names[i] if i < len(column_names) else f"COLUMN_{i + 1}"
+                    row_dict[col_name] = str(value) if value is not None else ""
+                results.append(row_dict)
+            elif isinstance(item, dict):
+                results.append(item)
+            else:
+                results.append({"VALUE": str(item)})
+        
+        return results
+
+    def format_results_llm_node(self, state: AutosysState) -> AutosysState:
+        """LLM-driven result formatting"""
+        
+        try:
+            results = state["query_results"]["results"]
+            
+            formatting_prompt = f"""
+Create professional, visually appealing HTML presentation for Autosys query results.
+
+CONTEXT:
+- Original Query: "{state['user_question']}"
+- Query Type: {state.get('query_type', 'query')}
+- Database Instance: {state['query_results'].get('instance_used', 'Unknown')}
+- Results Count: {len(results)}
+- Execution Time: {state['query_results'].get('execution_time', 0):.2f}s
+- Job Name: {state.get('extracted_job_name', 'N/A')}
+- Calendar Name: {state.get('extracted_calendar_name', 'N/A')}
+
+QUERY RESULTS:
+{json.dumps(results[:10], indent=2, default=str)}
+
+REQUIREMENTS:
+1. Create responsive HTML with inline CSS
+2. Use professional color scheme and typography
+3. Include clear header with context information
+4. Format data in readable table or card layout
+5. Add status badges with appropriate colors:
+   - SUCCESS: Green background
+   - FAILURE/FAILED: Red background  
+   - RUNNING: Blue background
+   - INACTIVE: Gray background
+6. Include summary statistics
+7. Add metadata footer with execution details
+8. Handle empty results gracefully
+9. Use mobile-friendly responsive design
+10. Include proper spacing and visual hierarchy
+
+Generate complete HTML with professional styling. Return only HTML:
+"""
+            
+            response = self.llm.invoke(formatting_prompt)
+            formatted_html = response.content if hasattr(response, 'content') else str(response)
+            
+            # Clean HTML if wrapped in markdown
+            formatted_html = re.sub(r'```html\s*', '', formatted_html, flags=re.IGNORECASE)
+            formatted_html = re.sub(r'```\s*$', '', formatted_html)
+            
+            state["formatted_output"] = formatted_html
+            
+        except Exception as e:
+            # Fallback formatting
+            results_count = len(state["query_results"].get("results", []))
+            instance_used = state["query_results"].get("instance_used", "Unknown")
+            
+            if results_count == 0:
+                state["formatted_output"] = f"""
+                <div style="padding: 20px; background: #fff3cd; border: 1px solid #ffeaa7; border-radius: 5px;">
+                    <h4 style="margin: 0 0 10px 0; color: #856404;">No Results Found</h4>
+                    <p style="margin: 0; color: #856404;">No records found matching your criteria in instance: <strong>{instance_used}</strong></p>
+                </div>
+                """
+            else:
+                state["formatted_output"] = f"""
+                <div style="border: 1px solid #dee2e6; border-radius: 5px; padding: 15px;">
+                    <h4 style="margin: 0 0 10px 0;">Query Results</h4>
+                    <p>Found {results_count} results from instance: <strong>{instance_used}</strong></p>
+                    <pre style="background: #f8f9fa; padding: 10px; border-radius: 3px; font-size: 11px; overflow: auto;">{json.dumps(state["query_results"]["results"][:5], indent=2, default=str)}</pre>
+                </div>
+                """
+        
+        return state
+
+    def handle_error_llm_node(self, state: AutosysState) -> AutosysState:
+        """LLM-driven error handling and user guidance"""
+        
+        try:
+            error_handling_prompt = f"""
+Create a helpful, user-friendly error message and guidance for this Autosys system error.
+
+ERROR CONTEXT:
+- User Query: "{state['user_question']}"
+- Error Message: {state.get('error', 'Unknown error')}
+- SQL Query: {state.get('sql_query', 'Not generated')}
+- Available Instances: {', '.join(self.db_manager.list_instances())}
+- System Analysis: {json.dumps(state.get('llm_analysis', {}), indent=2)}
+
+REQUIREMENTS:
+1. Create empathetic, professional error message
+2. Explain what went wrong in user-friendly terms
+3. Provide specific suggestions for resolution
+4. Include helpful examples of correct query formats
+5. Show available resources (instances, etc.)
+6. Maintain encouraging tone
+7. Format as professional HTML with good visual design
+8. Include technical details in collapsible section if helpful
+
+Generate supportive HTML error message. Return only HTML:
+"""
+            
+            response = self.llm.invoke(error_handling_prompt)
+            error_html = response.content if hasattr(response, 'content') else str(response)
+            
+            # Clean HTML
+            error_html = re.sub(r'```html\s*', '', error_html, flags=re.IGNORECASE)
+            error_html = re.sub(r'```\s*$', '', error_html)
+            
+            state["formatted_output"] = error_html
+            
+        except Exception as e:
+            # Fallback error message if LLM fails
+            error_msg = state.get("error", "Unknown error occurred")
+            state["formatted_output"] = f"""
+            <div style="border: 1px solid #dc3545; background: #f8d7da; color: #721c24; padding: 15px; border-radius: 5px;">
+                <h4 style="margin: 0 0 10px 0;">System Error</h4>
+                <p style="margin: 0;"><strong>Error:</strong> {error_msg}</p>
+                <p style="margin: 10px 0 0 0; font-size: 12px;">Please try rephrasing your request or contact support if the issue persists.</p>
+            </div>
+            """
+        
+        return state
+
+    # LLM-driven conditional edge functions
+    def _llm_routing_decision(self, state: AutosysState) -> str:
+        """LLM determines routing based on analysis"""
+        analysis = state.get("llm_analysis", {})
+        return "conversation" if analysis.get("is_general_conversation", False) else "database"
+
+    def _llm_parameter_check(self, state: AutosysState) -> str:
+        """LLM determines if parameters are sufficient"""
+        missing_params = state.get("missing_parameters", [])
+        return "needs_params" if missing_params else "has_all_params"
+
+    def _llm_execution_check(self, state: AutosysState) -> str:
+        """Check if ready for execution"""
+        return "error" if state.get("error") else "execute"
+
+    def _llm_result_check(self, state: AutosysState) -> str:
+        """Check query results"""
+        if state.get("error"):
+            return "error"
+        elif state.get("query_results", {}).get("success"):
+            return "format"
+        else:
+            return "error"
+
+    def query(self, user_question: str, session_id: str) -> Dict[str, Any]:
+        """Main method to process user input with complete LLM analysis"""
+        
+        initial_state = {
+            "messages": [],
+            "user_question": user_question,
+            "llm_analysis": {},
+            "is_general_conversation": False,
+            "extracted_instance": "",
+            "extracted_job_name": "",
+            "extracted_calendar_name": "", 
+            "missing_parameters": [],
+            "query_type": "",
+            "sql_query": "",
+            "query_results": {},
+            "formatted_output": "",
+            "error": "",
+            "session_id": session_id
+        }
+        
+        config = {"configurable": {"thread_id": session_id}}
+        
+        try:
+            final_state = self.graph.invoke(initial_state, config=config)
+            
+            return {
+                "success": not bool(final_state.get("error")),
+                "formatted_output": final_state.get("formatted_output", ""),
+                "is_conversation": final_state.get("is_general_conversation", False),
+                "needs_clarification": bool(final_state.get("missing_parameters", [])),
+                "query_type": final_state.get("query_type", ""),
+                "llm_analysis": final_state.get("llm_analysis", {}),
+                "error": final_state.get("error", "")
+            }
+            
+        except Exception as e:
+            self.logger.error(f"LLM-driven system execution failed: {e}")
+            return {
+                "success": False,
+                "formatted_output": f"""
+                <div style="border: 1px solid #dc3545; background: #f8d7da; color: #721c24; padding: 15px; border-radius: 5px;">
+                    <h4>System Error</h4>
+                    <p>LLM-driven system execution failed: {str(e)}</p>
+                </div>
+                """,
+                "error": str(e)
+            }
+
+# ============================================================================
+# LLM-DRIVEN INTERFACE FUNCTIONS
+# ============================================================================
+
+# Global system instance
+_autosys_system = None
+
+def setup_autosys_multi_database_system(database_configs: Dict[str, Any], llm_instance):
+    """
+    Setup the LLM-driven multi-database Autosys system
+    
+    Args:
+        database_configs: Dictionary of database configurations
+        llm_instance: Your LLM instance
+    
+    Returns:
+        Configured system status
+    """
+    global _autosys_system
+    
+    try:
+        # Create database manager
+        db_manager = DatabaseManager()
+        
+        # Add all database instances
+        for instance_name, config in database_configs.items():
+            autosys_db = config["autosys_db"]
+            description = config.get("description", "")
+            db_manager.add_instance(instance_name, autosys_db, description)
+            logger.info(f"Added instance {instance_name}: {description}")
+        
+        # Initialize the LLM-driven system
+        _autosys_system = LLMDrivenAutosysSystem(db_manager, llm_instance)
+        
+        logger.info("LLM-driven multi-database Autosys system initialized successfully")
+        
+        return {
+            "status": "ready",
+            "instances": db_manager.list_instances(),
+            "features": [
+                "Complete LLM-driven intent analysis",
+                "AI-powered parameter extraction and validation", 
+                "LLM-generated clarification requests",
+                "Intelligent SQL query generation",
+                "AI-driven result formatting",
+                "Smart error handling with user guidance",
+                "Context-aware conversation handling",
+                "Session persistence with memory"
+            ]
+        }
+        
+    except Exception as e:
+        logger.error(f"LLM-driven system setup failed: {e}")
+        raise Exception(f"Failed to initialize LLM-driven system: {str(e)}")
+
+def get_chat_response(message: str, session_id: str) -> str:
+    """LLM-driven chat function"""
+    global _autosys_system
+    
+    try:
+        if not message or not message.strip():
+            message = "Hello! How can I help you today?"
+        
+        if not _autosys_system:
+            return """
+            <div style="border: 1px solid #ffc107; background: #fff3cd; color: #856404; padding: 15px; border-radius: 5px;">
+                <h4>System Not Ready</h4>
+                <p>The LLM-driven multi-database system is not initialized. Please contact administrator.</p>
+            </div>
+            """
+        
+        # Process message with complete LLM analysis
+        result = _autosys_system.query(message.strip(), session_id)
+        
+        return result["formatted_output"]
+        
+    except Exception as e:
+        logger.error(f"LLM-driven chat response error: {e}")
+        return f"""
+        <div style="border: 1px solid #dc3545; background: #f8d7da; color: #721c24; padding: 15px; border-radius: 5px;">
+            <h4>System Error</h4>
+            <p>Error processing request: {str(e)}</p>
+        </div>
+        """
+
+def extract_last_ai_message(result) -> str:
+    """Extract final response (for compatibility)"""
+    if isinstance(result, dict) and "formatted_output" in result:
+        return result["formatted_output"]
+    elif isinstance(result, str):
+        return result
+    else:
+        return str(result)
+
+def get_database_instances() -> Dict[str, Any]:
+    """Get information about available database instances"""
+    global _autosys_system
+    
+    if not _autosys_system:
+        return {"error": "System not initialized"}
+    
+    try:
+        return {
+            "instances": _autosys_system.db_manager.list_instances(),
+            "detailed_info": _autosys_system.db_manager.get_instance_info(),
+            "total_count": len(_autosys_system.db_manager.instances)
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+# ============================================================================
+# LLM-DRIVEN USAGE EXAMPLES
+# ============================================================================
+
+def demonstrate_llm_driven_system():
+    """Examples of LLM-driven behavior"""
+    
+    llm_driven_examples = [
+        {
+            "scenario": "Ambiguous Job Request",
+            "user_input": "I need job information",
+            "llm_analysis": "Detects job_details intent, determines job_name and instance required",
+            "system_response": "LLM generates contextual clarification with examples",
+            "outcome": "User provides specific job name and instance"
+        },
+        {
+            "scenario": "Complex Calendar Query", 
+            "user_input": "Show me calendar stuff for production",
+            "llm_analysis": "Identifies calendar_details intent, extracts PROD instance, needs calendar_name",
+            "system_response": "LLM requests specific calendar name with PROD context",
+            "outcome": "Targeted query with proper parameters"
+        },
+        {
+            "scenario": "Natural Language Status Check",
+            "user_input": "Are there any failed jobs today in dev environment?",
+            "llm_analysis": "Detects job_status intent, extracts DEV instance, no specific job needed",
+            "system_response": "LLM generates appropriate SQL for failed jobs today in DEV",
+            "outcome": "Direct execution with results"
+        },
+        {
+            "scenario": "Casual Conversation",
+            "user_input": "Thanks for your help earlier!",
+            "llm_analysis": "Identifies general conversation, no database intent",
+            "system_response": "LLM generates friendly conversational response",
+            "outcome": "Natural conversation handling"
+        }
+    ]
+    
+    return llm_driven_examples
+
+def main():
+    """LLM-driven system demonstration"""
+    print("LLM-DRIVEN Multi-Database Autosys System")
+    print("========================================")
+    print()
+    print("COMPLETE LLM INTEGRATION:")
+    print("- Intent analysis entirely LLM-driven")
+    print("- Parameter extraction using AI reasoning")
+    print("- SQL generation with intelligent context")
+    print("- Result formatting optimized by LLM")
+    print("- Error handling with AI-generated guidance")
+    print("- Conversation responses naturally generated")
+    print()
+    
+    examples = demonstrate_llm_driven_system()
+    print("LLM-DRIVEN CONVERSATION FLOWS:")
+    for i, example in enumerate(examples, 1):
+        print(f"{i}. {example['scenario']}:")
+        print(f"   User: '{example['user_input']}'")
+        print(f"   LLM Analysis: {example['llm_analysis']}")
+        print(f"   System: {example['system_response']}")
+        print(f"   Result: {example['outcome']}")
+        print()
+
+if __name__ == "__main__":
+    main()
+
+# ============================================================================
+# LLM-DRIVEN INTEGRATION GUIDE
+# ============================================================================
+
+"""
+COMPLETE LLM-DRIVEN AUTOSYS SYSTEM
+
+This system eliminates ALL rule-based logic and uses LLM analysis throughout:
+
+KEY LLM INTEGRATIONS:
+
+1. INTENT ANALYSIS (analyze_with_llm_node):
+   - LLM comprehensively analyzes user intent
+   - Determines conversation vs database query
+   - Identifies specific query types (job_details, calendar_details, etc.)
+   - Assesses parameter requirements
+   - Provides confidence scoring and reasoning
+
+2. PARAMETER EXTRACTION (extract_parameters_llm_node):
+   - LLM validates and extracts all parameters
+   - Applies fuzzy matching intelligence
+   - Assesses extraction confidence
+   - Determines missing critical parameters
+
+3. CLARIFICATION GENERATION (request_missing_params_llm_node):
+   - LLM creates contextual clarification messages
+   - Generates appropriate examples
+   - Formats professional HTML responses
+   - Maintains encouraging, helpful tone
+
+4. SQL GENERATION (generate_sql_llm_node):
+   - LLM constructs optimized Oracle SQL
+   - Incorporates all extracted parameters
+   - Applies complex query logic
+   - Handles various query types intelligently
+
+5. RESULT FORMATTING (format_results_llm_node):
+   - LLM creates professional HTML presentations
+   - Applies appropriate styling and colors
+   - Includes summary statistics
+   - Handles empty results gracefully
+
+6. ERROR HANDLING (handle_error_llm_node):
+   - LLM generates user-friendly error messages
+   - Provides specific resolution guidance
+   - Creates supportive, professional responses
+
+7. CONVERSATION HANDLING (handle_conversation_node):
+   - LLM generates natural conversation responses
+   - Maintains context and personality
+   - Provides helpful system information
+
+ADVANTAGES:
+- No hardcoded rules or patterns
+- Intelligent context understanding
+- Natural language processing
+- Adaptive to user communication styles
+- Self-improving through LLM capabilities
+
+USAGE: Drop-in replacement for existing system with same API
+"""
+
+
+
+
+
+
+
+@@@@@@@@@@@@
 # ============================================================================
 # MULTI-DATABASE AUTOSYS SYSTEM WITH INSTANCE SELECTION
 # ============================================================================
