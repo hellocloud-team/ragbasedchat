@@ -1,3 +1,418 @@
+
+# ============================================================================
+# FIXES FOR STRING INDICES ERROR - KEEP EXISTING FUNCTION/CLASS NAMES
+# ============================================================================
+
+# Fix 1: Add this helper method to your LLMDrivenAutosysSystem class
+class LLMDrivenAutosysSystem:
+    
+    def _safe_parse_llm_json(self, llm_response) -> Dict[str, Any]:
+        """Helper method to safely parse LLM JSON responses"""
+        try:
+            # Extract content properly
+            if hasattr(llm_response, 'content'):
+                content = llm_response.content
+            else:
+                content = str(llm_response)
+            
+            self.logger.debug(f"Raw LLM response: {content}")
+            
+            # Extract JSON from response
+            import re
+            json_match = re.search(r'\{.*\}', content, re.DOTALL)
+            
+            if json_match:
+                json_str = json_match.group()
+                parsed_json = json.loads(json_str)
+                return parsed_json
+            else:
+                self.logger.warning("No JSON found in LLM response")
+                return {}
+                
+        except json.JSONDecodeError as e:
+            self.logger.error(f"JSON parsing failed: {e}")
+            self.logger.error(f"Content was: {content}")
+            return {}
+        except Exception as e:
+            self.logger.error(f"Error parsing LLM response: {e}")
+            return {}
+
+# Fix 2: Update your analyze_with_llm_node method
+def analyze_with_llm_node(self, state: AutosysState) -> AutosysState:
+    """Analyze user intent with proper error handling"""
+    
+    try:
+        available_instances = self.db_manager.list_instances()
+        
+        analysis_prompt = f"""
+You are an expert Autosys database assistant. Analyze this user message.
+
+USER MESSAGE: "{state['user_question']}"
+AVAILABLE INSTANCES: {', '.join(available_instances)}
+
+Return ONLY valid JSON in this exact format (no other text):
+{{
+    "is_general_conversation": false,
+    "query_type": "job_details",
+    "confidence_level": "high",
+    "requires_job_name": true,
+    "requires_calendar_name": false,
+    "requires_instance": true,
+    "extracted_instance": null,
+    "extracted_job_name": null,
+    "extracted_calendar_name": null,
+    "missing_parameters": ["job_name", "instance"],
+    "user_intent_summary": "User wants job details",
+    "recommended_action": "parameter_collection",
+    "reasoning": "Analysis reasoning here"
+}}
+"""
+        
+        response = self.llm.invoke(analysis_prompt)
+        
+        # FIX: Use safe parsing method
+        analysis = self._safe_parse_llm_json(response)
+        
+        # FIX: Provide defaults if parsing failed
+        if not analysis:
+            analysis = {
+                "is_general_conversation": True,
+                "query_type": "general_conversation", 
+                "missing_parameters": [],
+                "extracted_instance": None,
+                "extracted_job_name": None,
+                "extracted_calendar_name": None
+            }
+        
+        # FIX: Safe assignment with get() method
+        state["llm_analysis"] = analysis
+        state["is_general_conversation"] = analysis.get("is_general_conversation", False)
+        state["query_type"] = analysis.get("query_type", "general_query")
+        state["extracted_instance"] = analysis.get("extracted_instance") or ""
+        state["extracted_job_name"] = analysis.get("extracted_job_name") or ""
+        state["extracted_calendar_name"] = analysis.get("extracted_calendar_name") or ""
+        state["missing_parameters"] = analysis.get("missing_parameters", [])
+        
+    except Exception as e:
+        self.logger.error(f"LLM analysis failed: {str(e)}")
+        # FIX: Safe fallback values
+        state["llm_analysis"] = {"error": str(e)}
+        state["is_general_conversation"] = True
+        state["query_type"] = "general_conversation"
+        state["extracted_instance"] = ""
+        state["extracted_job_name"] = ""
+        state["extracted_calendar_name"] = ""
+        state["missing_parameters"] = []
+    
+    return state
+
+# Fix 3: Update your extract_parameters_llm_node method
+def extract_parameters_llm_node(self, state: AutosysState) -> AutosysState:
+    """Extract parameters with proper error handling"""
+    
+    try:
+        available_instances = self.db_manager.list_instances()
+        
+        extraction_prompt = f"""
+Extract parameters and return ONLY valid JSON:
+
+User Query: "{state['user_question']}"
+Available Instances: {', '.join(available_instances)}
+
+{{
+    "validated_instance": null,
+    "validated_job_name": null,
+    "validated_calendar_name": null,
+    "instance_confidence": "none",
+    "job_confidence": "none",
+    "calendar_confidence": "none",
+    "missing_critical_params": [],
+    "can_proceed": false,
+    "validation_notes": "Parameter extraction notes"
+}}
+"""
+        
+        response = self.llm.invoke(extraction_prompt)
+        
+        # FIX: Use safe parsing
+        validation = self._safe_parse_llm_json(response)
+        
+        # FIX: Provide defaults if parsing failed
+        if not validation:
+            validation = {
+                "validated_instance": None,
+                "validated_job_name": None,
+                "validated_calendar_name": None,
+                "missing_critical_params": ["extraction_failed"]
+            }
+        
+        # FIX: Safe parameter assignment
+        state["extracted_instance"] = validation.get("validated_instance") or ""
+        state["extracted_job_name"] = validation.get("validated_job_name") or ""
+        state["extracted_calendar_name"] = validation.get("validated_calendar_name") or ""
+        state["missing_parameters"] = validation.get("missing_critical_params", [])
+        
+        # FIX: Ensure llm_analysis exists before updating
+        if "llm_analysis" not in state:
+            state["llm_analysis"] = {}
+        state["llm_analysis"]["validation"] = validation
+        
+    except Exception as e:
+        self.logger.error(f"Parameter extraction failed: {str(e)}")
+        # FIX: Safe defaults
+        state["extracted_instance"] = ""
+        state["extracted_job_name"] = ""
+        state["extracted_calendar_name"] = ""
+        state["missing_parameters"] = ["parameter_extraction_failed"]
+        
+    return state
+
+# Fix 4: Update your query method
+def query(self, user_question: str, session_id: str) -> Dict[str, Any]:
+    """Main query method with comprehensive error handling"""
+    
+    # FIX: Initialize all required state fields
+    initial_state = {
+        "messages": [],
+        "user_question": user_question,
+        "llm_analysis": {},
+        "is_general_conversation": False,
+        "extracted_instance": "",
+        "extracted_job_name": "",
+        "extracted_calendar_name": "", 
+        "missing_parameters": [],
+        "query_type": "",
+        "sql_query": "",
+        "query_results": {},
+        "formatted_output": "",
+        "error": "",
+        "session_id": session_id
+    }
+    
+    config = {"configurable": {"thread_id": session_id}}
+    
+    try:
+        final_state = self.graph.invoke(initial_state, config=config)
+        
+        # FIX: Safe result extraction with proper defaults
+        return {
+            "success": not bool(final_state.get("error", "")),
+            "formatted_output": final_state.get("formatted_output", ""),
+            "is_conversation": final_state.get("is_general_conversation", False),
+            "needs_clarification": bool(final_state.get("missing_parameters", [])),
+            "query_type": final_state.get("query_type", ""),
+            "llm_analysis": final_state.get("llm_analysis", {}),
+            "error": final_state.get("error", "")
+        }
+        
+    except Exception as e:
+        self.logger.error(f"Graph execution failed: {e}")
+        return {
+            "success": False,
+            "formatted_output": f"""
+            <div style="border: 1px solid #dc3545; background: #f8d7da; color: #721c24; padding: 15px; border-radius: 5px;">
+                <h4>System Error</h4>
+                <p>Graph execution failed: {str(e)}</p>
+            </div>
+            """,
+            "error": str(e)
+        }
+
+# Fix 5: Update your get_chat_response function
+def get_chat_response(message: str, session_id: str) -> str:
+    """Chat function with proper error handling"""
+    global _autosys_system
+    
+    try:
+        if not message or not message.strip():
+            message = "Hello! How can I help you today?"
+        
+        if not _autosys_system:
+            return """
+            <div style="border: 1px solid #ffc107; background: #fff3cd; color: #856404; padding: 15px; border-radius: 5px;">
+                <h4>System Not Ready</h4>
+                <p>The system is not initialized. Please contact administrator.</p>
+            </div>
+            """
+        
+        # Process message
+        result = _autosys_system.query(message.strip(), session_id)
+        
+        # FIX: Check result type before accessing
+        if isinstance(result, dict):
+            return result.get("formatted_output", "No output generated")
+        elif isinstance(result, str):
+            return result
+        else:
+            return str(result)
+        
+    except Exception as e:
+        logger.error(f"Chat response error: {e}", exc_info=True)
+        return f"""
+        <div style="border: 1px solid #dc3545; background: #f8d7da; color: #721c24; padding: 15px; border-radius: 5px;">
+            <h4>Processing Error</h4>
+            <p>Error processing request: {str(e)}</p>
+            <p style="font-size: 12px;">Please try rephrasing your request.</p>
+        </div>
+        """
+
+# Fix 6: Update your format_results_llm_node method
+def format_results_llm_node(self, state: AutosysState) -> AutosysState:
+    """Format results with proper error handling"""
+    
+    try:
+        # FIX: Safe access to query results
+        query_results = state.get("query_results", {})
+        if not isinstance(query_results, dict):
+            query_results = {}
+            
+        results = query_results.get("results", [])
+        
+        if not results:
+            instance_used = query_results.get("instance_used", "Unknown")
+            state["formatted_output"] = f"""
+            <div style="padding: 20px; background: #fff3cd; border: 1px solid #ffeaa7; border-radius: 5px;">
+                <h4 style="margin: 0 0 10px 0; color: #856404;">No Results Found</h4>
+                <p style="margin: 0; color: #856404;">No records found in instance: <strong>{instance_used}</strong></p>
+            </div>
+            """
+            return state
+        
+        # Continue with LLM formatting...
+        formatting_prompt = f"""
+Create HTML for Autosys query results:
+
+Results Count: {len(results)}
+Instance: {query_results.get('instance_used', 'Unknown')}
+
+Data: {json.dumps(results[:5], indent=2, default=str)}
+
+Generate professional HTML with styling.
+"""
+        
+        response = self.llm.invoke(formatting_prompt)
+        
+        # FIX: Safe content extraction
+        if hasattr(response, 'content'):
+            formatted_html = response.content
+        else:
+            formatted_html = str(response)
+        
+        # Clean HTML markers
+        formatted_html = re.sub(r'```html\s*', '', formatted_html, flags=re.IGNORECASE)
+        formatted_html = re.sub(r'```\s*$', '', formatted_html)
+        
+        state["formatted_output"] = formatted_html
+        
+    except Exception as e:
+        self.logger.error(f"Result formatting failed: {e}")
+        # FIX: Fallback formatting
+        results_count = len(state.get("query_results", {}).get("results", []))
+        state["formatted_output"] = f"""
+        <div style="border: 1px solid #dee2e6; border-radius: 5px; padding: 15px;">
+            <h4>Query Results</h4>
+            <p>Found {results_count} results</p>
+            <p style="color: #666; font-size: 12px;">Result formatting encountered an error: {str(e)}</p>
+        </div>
+        """
+    
+    return state
+
+# Fix 7: Add debugging utility (add this as a method to your class)
+def _debug_state_safely(self, state, node_name="Unknown"):
+    """Debug utility to safely log state information"""
+    try:
+        self.logger.debug(f"=== {node_name} STATE DEBUG ===")
+        for key, value in state.items():
+            value_type = type(value).__name__
+            if isinstance(value, (dict, list)):
+                value_preview = f"{value_type} with {len(value)} items"
+            else:
+                value_preview = str(value)[:100] + "..." if len(str(value)) > 100 else str(value)
+            self.logger.debug(f"{key}: {value_type} = {value_preview}")
+    except Exception as e:
+        self.logger.error(f"Debug logging failed: {e}")
+
+# Fix 8: Update your handle_error_llm_node method
+def handle_error_llm_node(self, state: AutosysState) -> AutosysState:
+    """Handle errors with safe fallback"""
+    
+    try:
+        error_msg = state.get("error", "Unknown error occurred")
+        
+        # Try LLM-generated error message
+        error_prompt = f"""
+Create a user-friendly HTML error message for this error:
+
+Error: {error_msg}
+User Query: {state.get('user_question', 'Unknown')}
+
+Generate helpful HTML error message.
+"""
+        
+        response = self.llm.invoke(error_prompt)
+        
+        # FIX: Safe response handling
+        if hasattr(response, 'content'):
+            error_html = response.content
+        else:
+            error_html = str(response)
+            
+        # Clean HTML markers
+        error_html = re.sub(r'```html\s*', '', error_html, flags=re.IGNORECASE)
+        error_html = re.sub(r'```\s*$', '', error_html)
+        
+        state["formatted_output"] = error_html
+        
+    except Exception as e:
+        # FIX: Ultimate fallback if LLM fails
+        self.logger.error(f"Error handling failed: {e}")
+        error_msg = state.get("error", "System error occurred")
+        state["formatted_output"] = f"""
+        <div style="border: 1px solid #dc3545; background: #f8d7da; color: #721c24; padding: 15px; border-radius: 5px;">
+            <h4>System Error</h4>
+            <p>Error: {error_msg}</p>
+            <p style="font-size: 12px;">Please try rephrasing your request or contact support.</p>
+        </div>
+        """
+    
+    return state
+
+# ============================================================================
+# IMPLEMENTATION INSTRUCTIONS
+# ============================================================================
+
+"""
+TO APPLY THESE FIXES TO YOUR EXISTING CODE:
+
+1. Add the _safe_parse_llm_json method to your LLMDrivenAutosysSystem class
+
+2. Replace the content of these existing methods with the fixed versions:
+   - analyze_with_llm_node
+   - extract_parameters_llm_node  
+   - query
+   - format_results_llm_node
+   - handle_error_llm_node
+
+3. Replace your existing get_chat_response function with the fixed version
+
+4. Add the _debug_state_safely method for debugging
+
+KEY CHANGES MADE:
+- Added safe JSON parsing for all LLM responses
+- Added proper fallback values when parsing fails
+- Added type checking before dictionary access
+- Added comprehensive error handling in all methods
+- Added safe state initialization
+- Added debug logging capabilities
+
+The fixes maintain all your existing function and class names while making them robust against the string indices error.
+"""
+
+†*****"****"""""†
+
+
+
 # ============================================================================
 # DEBUG AND FIX STRING INDICES ERROR
 # ============================================================================
