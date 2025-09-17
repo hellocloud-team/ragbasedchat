@@ -1,4 +1,395 @@
 # ============================================================================
+# DEBUG AND FIX STRING INDICES ERROR
+# ============================================================================
+
+import json
+import logging
+from typing import Dict, Any, Union
+
+logger = logging.getLogger(__name__)
+
+# ============================================================================
+# COMMON CAUSES AND FIXES FOR "string indices must be integers" ERROR
+# ============================================================================
+
+def debug_llm_response_parsing():
+    """Debug LLM response parsing issues"""
+    
+    # PROBLEM 1: LLM returns string instead of expected JSON
+    def safe_parse_llm_json(llm_response) -> Dict[str, Any]:
+        """Safely parse LLM response that should contain JSON"""
+        
+        try:
+            # Get content from LLM response
+            if hasattr(llm_response, 'content'):
+                content = llm_response.content
+            else:
+                content = str(llm_response)
+            
+            logger.debug(f"Raw LLM response: {content}")
+            
+            # Try to extract JSON from response
+            import re
+            json_match = re.search(r'\{.*\}', content, re.DOTALL)
+            
+            if json_match:
+                json_str = json_match.group()
+                try:
+                    parsed_json = json.loads(json_str)
+                    logger.debug(f"Successfully parsed JSON: {parsed_json}")
+                    return parsed_json
+                except json.JSONDecodeError as e:
+                    logger.error(f"JSON parsing failed: {e}")
+                    logger.error(f"JSON string was: {json_str}")
+                    return {}
+            else:
+                logger.warning("No JSON found in LLM response")
+                return {}
+                
+        except Exception as e:
+            logger.error(f"Error parsing LLM response: {e}")
+            return {}
+
+    return safe_parse_llm_json
+
+# ============================================================================
+# FIXED LLM-DRIVEN NODES
+# ============================================================================
+
+class FixedLLMDrivenAutosysSystem:
+    """Fixed version of LLM-driven system with proper error handling"""
+    
+    def __init__(self, db_manager, llm_instance):
+        self.db_manager = db_manager
+        self.llm = llm_instance
+        self.logger = logging.getLogger(self.__class__.__name__)
+        # ... rest of initialization
+
+    def analyze_with_llm_node(self, state) -> Dict[str, Any]:
+        """Fixed LLM analysis node with proper error handling"""
+        
+        try:
+            available_instances = self.db_manager.list_instances()
+            instance_info = self.db_manager.get_instance_info()
+            
+            analysis_prompt = f"""
+You are an expert Autosys database assistant. Analyze this user message comprehensively.
+
+USER MESSAGE: "{state['user_question']}"
+AVAILABLE DATABASE INSTANCES: {', '.join(available_instances)}
+
+Provide your analysis in this exact JSON format (return ONLY the JSON, no other text):
+{{
+    "is_general_conversation": false,
+    "query_type": "job_details",
+    "confidence_level": "high",
+    "requires_job_name": true,
+    "requires_calendar_name": false,
+    "requires_instance": true,
+    "extracted_instance": null,
+    "extracted_job_name": null,
+    "extracted_calendar_name": null,
+    "missing_parameters": ["job_name", "instance"],
+    "user_intent_summary": "User wants job details",
+    "recommended_action": "parameter_collection",
+    "reasoning": "User asked for job details but didn't specify job name or instance"
+}}
+"""
+            
+            response = self.llm.invoke(analysis_prompt)
+            
+            # FIXED: Proper response handling
+            if hasattr(response, 'content'):
+                content = response.content
+            else:
+                content = str(response)
+            
+            logger.debug(f"LLM analysis raw response: {content}")
+            
+            # Parse JSON safely
+            try:
+                import re
+                json_match = re.search(r'\{.*\}', content, re.DOTALL)
+                if json_match:
+                    analysis = json.loads(json_match.group())
+                    logger.debug(f"Parsed analysis: {analysis}")
+                else:
+                    logger.warning("No JSON found in LLM response, using defaults")
+                    analysis = self._get_default_analysis()
+                    
+            except json.JSONDecodeError as e:
+                logger.error(f"JSON parsing failed: {e}")
+                logger.error(f"Raw content: {content}")
+                analysis = self._get_default_analysis()
+            
+            # FIXED: Safe dictionary access
+            state["llm_analysis"] = analysis
+            state["is_general_conversation"] = analysis.get("is_general_conversation", False)
+            state["query_type"] = analysis.get("query_type", "general_query")
+            state["extracted_instance"] = analysis.get("extracted_instance") or ""
+            state["extracted_job_name"] = analysis.get("extracted_job_name") or ""
+            state["extracted_calendar_name"] = analysis.get("extracted_calendar_name") or ""
+            state["missing_parameters"] = analysis.get("missing_parameters", [])
+            
+        except Exception as e:
+            logger.error(f"LLM analysis failed: {str(e)}")
+            # FIXED: Provide safe defaults
+            state["llm_analysis"] = self._get_default_analysis()
+            state["is_general_conversation"] = True  # Safe fallback
+            state["missing_parameters"] = []
+        
+        return state
+
+    def _get_default_analysis(self) -> Dict[str, Any]:
+        """Provide safe default analysis when LLM fails"""
+        return {
+            "is_general_conversation": True,
+            "query_type": "general_conversation",
+            "confidence_level": "low",
+            "requires_job_name": False,
+            "requires_calendar_name": False,
+            "requires_instance": False,
+            "extracted_instance": None,
+            "extracted_job_name": None,
+            "extracted_calendar_name": None,
+            "missing_parameters": [],
+            "user_intent_summary": "Analysis failed, treating as conversation",
+            "recommended_action": "conversation",
+            "reasoning": "LLM analysis failed, falling back to safe defaults"
+        }
+
+    def extract_parameters_llm_node(self, state) -> Dict[str, Any]:
+        """Fixed parameter extraction with proper error handling"""
+        
+        try:
+            available_instances = self.db_manager.list_instances()
+            
+            extraction_prompt = f"""
+Extract parameters from this query and return ONLY JSON:
+
+User Query: "{state['user_question']}"
+Available Instances: {', '.join(available_instances)}
+
+{{
+    "validated_instance": null,
+    "validated_job_name": null, 
+    "validated_calendar_name": null,
+    "instance_confidence": "none",
+    "job_confidence": "none",
+    "calendar_confidence": "none",
+    "missing_critical_params": [],
+    "can_proceed": true,
+    "fuzzy_matches_applied": [],
+    "validation_notes": "Parameter extraction analysis",
+    "recommendation": "proceed"
+}}
+"""
+            
+            response = self.llm.invoke(extraction_prompt)
+            
+            # FIXED: Safe response handling
+            content = response.content if hasattr(response, 'content') else str(response)
+            logger.debug(f"Parameter extraction raw response: {content}")
+            
+            try:
+                import re
+                json_match = re.search(r'\{.*\}', content, re.DOTALL)
+                if json_match:
+                    validation = json.loads(json_match.group())
+                else:
+                    validation = self._get_default_validation()
+            except json.JSONDecodeError as e:
+                logger.error(f"Parameter extraction JSON parsing failed: {e}")
+                validation = self._get_default_validation()
+            
+            # FIXED: Safe parameter assignment
+            state["extracted_instance"] = validation.get("validated_instance") or ""
+            state["extracted_job_name"] = validation.get("validated_job_name") or ""
+            state["extracted_calendar_name"] = validation.get("validated_calendar_name") or ""
+            state["missing_parameters"] = validation.get("missing_critical_params", [])
+            
+            # Store validation for debugging
+            if "llm_analysis" not in state:
+                state["llm_analysis"] = {}
+            state["llm_analysis"]["validation"] = validation
+            
+        except Exception as e:
+            logger.error(f"Parameter extraction failed: {str(e)}")
+            # Safe defaults
+            state["extracted_instance"] = ""
+            state["extracted_job_name"] = ""
+            state["extracted_calendar_name"] = ""
+            state["missing_parameters"] = ["parameter_extraction_failed"]
+        
+        return state
+
+    def _get_default_validation(self) -> Dict[str, Any]:
+        """Safe default validation when extraction fails"""
+        return {
+            "validated_instance": None,
+            "validated_job_name": None,
+            "validated_calendar_name": None,
+            "instance_confidence": "none",
+            "job_confidence": "none", 
+            "calendar_confidence": "none",
+            "missing_critical_params": ["extraction_failed"],
+            "can_proceed": False,
+            "fuzzy_matches_applied": [],
+            "validation_notes": "Parameter extraction failed",
+            "recommendation": "request_clarification"
+        }
+
+    def query(self, user_question: str, session_id: str) -> Dict[str, Any]:
+        """Fixed main query method with comprehensive error handling"""
+        
+        # FIXED: Ensure all required state fields exist
+        initial_state = {
+            "messages": [],
+            "user_question": user_question,
+            "llm_analysis": {},
+            "is_general_conversation": False,
+            "extracted_instance": "",
+            "extracted_job_name": "",
+            "extracted_calendar_name": "", 
+            "missing_parameters": [],
+            "query_type": "",
+            "sql_query": "",
+            "query_results": {},
+            "formatted_output": "",
+            "error": "",
+            "session_id": session_id
+        }
+        
+        config = {"configurable": {"thread_id": session_id}}
+        
+        try:
+            final_state = self.graph.invoke(initial_state, config=config)
+            
+            # FIXED: Safe result extraction
+            return {
+                "success": not bool(final_state.get("error", "")),
+                "formatted_output": final_state.get("formatted_output", ""),
+                "is_conversation": final_state.get("is_general_conversation", False),
+                "needs_clarification": bool(final_state.get("missing_parameters", [])),
+                "query_type": final_state.get("query_type", ""),
+                "llm_analysis": final_state.get("llm_analysis", {}),
+                "error": final_state.get("error", "")
+            }
+            
+        except Exception as e:
+            logger.error(f"Graph execution failed: {e}")
+            return {
+                "success": False,
+                "formatted_output": self._create_error_html(str(e)),
+                "error": str(e)
+            }
+
+    def _create_error_html(self, error_message: str) -> str:
+        """Create error HTML when system fails"""
+        return f"""
+        <div style="border: 1px solid #dc3545; background: #f8d7da; color: #721c24; padding: 15px; border-radius: 5px;">
+            <h4>System Error</h4>
+            <p>An error occurred while processing your request: {error_message}</p>
+            <p style="font-size: 12px; margin-top: 10px;">Please try rephrasing your question or contact support if the issue persists.</p>
+        </div>
+        """
+
+# ============================================================================
+# FIXED CHAT RESPONSE FUNCTION
+# ============================================================================
+
+def get_chat_response_fixed(message: str, session_id: str) -> str:
+    """Fixed chat function with comprehensive error handling"""
+    global _autosys_system
+    
+    try:
+        if not message or not message.strip():
+            message = "Hello! How can I help you today?"
+        
+        if not _autosys_system:
+            return """
+            <div style="border: 1px solid #ffc107; background: #fff3cd; color: #856404; padding: 15px; border-radius: 5px;">
+                <h4>System Not Ready</h4>
+                <p>The system is not initialized. Please contact administrator.</p>
+            </div>
+            """
+        
+        # FIXED: Process with error handling
+        result = _autosys_system.query(message.strip(), session_id)
+        
+        # FIXED: Safe result access
+        if isinstance(result, dict):
+            return result.get("formatted_output", "No output generated")
+        elif isinstance(result, str):
+            return result
+        else:
+            return str(result)
+        
+    except Exception as e:
+        logger.error(f"Chat response error: {e}", exc_info=True)
+        return f"""
+        <div style="border: 1px solid #dc3545; background: #f8d7da; color: #721c24; padding: 15px; border-radius: 5px;">
+            <h4>Processing Error</h4>
+            <p>Error: {str(e)}</p>
+            <p style="font-size: 12px;">Please try a simpler question or contact support.</p>
+        </div>
+        """
+
+# ============================================================================
+# DEBUGGING UTILITIES
+# ============================================================================
+
+def debug_state_types(state):
+    """Debug utility to check state variable types"""
+    logger.info("=== STATE TYPE DEBUGGING ===")
+    for key, value in state.items():
+        logger.info(f"{key}: {type(value)} = {value}")
+    logger.info("=== END STATE DEBUGGING ===")
+
+def safe_get_from_state(state, key: str, default_value=None):
+    """Safely get value from state with type checking"""
+    try:
+        value = state.get(key, default_value)
+        logger.debug(f"Retrieved {key}: {type(value)} = {value}")
+        return value
+    except Exception as e:
+        logger.error(f"Error accessing state['{key}']: {e}")
+        return default_value
+
+# ============================================================================
+# USAGE INSTRUCTIONS
+# ============================================================================
+
+"""
+TO FIX THE STRING INDICES ERROR:
+
+1. Replace your existing LLM nodes with the fixed versions above
+2. Use get_chat_response_fixed() instead of get_chat_response()
+3. Add debug logging to identify where the error occurs
+4. Ensure LLM responses are properly parsed as JSON
+
+COMMON CAUSES:
+- LLM returning plain text instead of JSON
+- Accessing dictionary keys on string variables
+- Missing error handling in LLM response parsing
+- State variables not initialized properly
+
+DEBUGGING STEPS:
+1. Add debug_state_types(state) in your nodes
+2. Check LLM response content before parsing
+3. Use safe_get_from_state() for state access
+4. Add try/catch around all LLM calls
+
+"""
+
+££££
+
+
+
+
+
+
+# ============================================================================
 # LLM-DRIVEN MULTI-DATABASE AUTOSYS SYSTEM - FULLY AI-POWERED
 # ============================================================================
 
