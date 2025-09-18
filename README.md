@@ -1,3 +1,419 @@
+# ============================================================================
+# SESSION MEMORY FOR CONVERSATIONAL CONTEXT
+# ============================================================================
+
+import json
+from typing import Dict, Any, Optional
+from datetime import datetime, timedelta
+
+# ============================================================================
+# SESSION CONTEXT MANAGER
+# ============================================================================
+
+class SessionContextManager:
+    """Manage conversational context across multiple exchanges"""
+    
+    def __init__(self):
+        self.sessions = {}  # session_id -> context_data
+        self.logger = logging.getLogger(self.__class__.__name__)
+    
+    def get_session_context(self, session_id: str) -> Dict[str, Any]:
+        """Get context for a session"""
+        if session_id not in self.sessions:
+            self.sessions[session_id] = {
+                "extracted_params": {},
+                "user_intent": "",
+                "conversation_history": [],
+                "last_activity": datetime.now(),
+                "pending_clarification": False
+            }
+        
+        return self.sessions[session_id]
+    
+    def update_session_context(self, session_id: str, updates: Dict[str, Any]):
+        """Update session context with new information"""
+        context = self.get_session_context(session_id)
+        context.update(updates)
+        context["last_activity"] = datetime.now()
+        
+        self.logger.debug(f"Updated session {session_id} context: {context}")
+    
+    def merge_extracted_params(self, session_id: str, new_params: Dict[str, Any]):
+        """Merge new extracted parameters with existing ones"""
+        context = self.get_session_context(session_id)
+        extracted_params = context.get("extracted_params", {})
+        
+        # Only update if new value is not empty/None
+        for key, value in new_params.items():
+            if value and value != "":
+                extracted_params[key] = value
+        
+        context["extracted_params"] = extracted_params
+        context["last_activity"] = datetime.now()
+        
+        self.logger.info(f"Merged params for session {session_id}: {extracted_params}")
+        return extracted_params
+    
+    def cleanup_old_sessions(self, max_age_hours: int = 24):
+        """Remove old inactive sessions"""
+        cutoff_time = datetime.now() - timedelta(hours=max_age_hours)
+        old_sessions = [
+            session_id for session_id, context in self.sessions.items()
+            if context["last_activity"] < cutoff_time
+        ]
+        
+        for session_id in old_sessions:
+            del self.sessions[session_id]
+        
+        if old_sessions:
+            self.logger.info(f"Cleaned up {len(old_sessions)} old sessions")
+
+# Global session manager
+session_manager = SessionContextManager()
+
+# ============================================================================
+# ENHANCED PARAMETER EXTRACTION WITH SESSION MEMORY
+# ============================================================================
+
+def extract_parameters_with_memory_node(self, state: AutosysState) -> AutosysState:
+    """Extract parameters while preserving session context"""
+    
+    try:
+        session_id = state["session_id"]
+        available_instances = self.db_manager.list_instances()
+        
+        # Get existing session context
+        session_context = session_manager.get_session_context(session_id)
+        existing_params = session_context.get("extracted_params", {})
+        
+        # Create extraction prompt with context
+        extraction_prompt = f"""
+Extract parameters from this query, considering previous context:
+
+CURRENT USER QUERY: "{state['user_question']}"
+PREVIOUS EXTRACTED PARAMETERS: {json.dumps(existing_params, indent=2)}
+AVAILABLE INSTANCES: {', '.join(available_instances)}
+
+Instructions:
+1. Extract any new parameters from the current query
+2. Keep existing parameters unless explicitly overridden
+3. If user provides missing information, use it to fill gaps
+
+Return ONLY JSON:
+{{
+    "extracted_instance": "instance_name_or_current_or_null",
+    "extracted_job_name": "job_name_or_current_or_null", 
+    "extracted_calendar_name": "calendar_name_or_current_or_null",
+    "user_intent": "what_user_wants_to_do",
+    "context_used": true_if_previous_context_was_helpful,
+    "missing_still": ["list", "of", "still", "missing", "params"]
+}}
+
+Examples:
+- If user previously said "job ABC123" and now says "in PROD", extract both
+- If no previous context exists, extract only from current query
+- If user provides new job name, replace the old one
+"""
+        
+        response = self.llm.invoke(extraction_prompt)
+        extraction_result = self._safe_parse_llm_json(response)
+        
+        if not extraction_result:
+            extraction_result = {"missing_still": ["extraction_failed"]}
+        
+        # Merge with existing parameters
+        new_params = {
+            "instance": extraction_result.get("extracted_instance"),
+            "job_name": extraction_result.get("extracted_job_name"),
+            "calendar_name": extraction_result.get("extracted_calendar_name")
+        }
+        
+        # Merge parameters preserving existing values
+        merged_params = session_manager.merge_extracted_params(session_id, new_params)
+        
+        # Update state with merged parameters
+        state["extracted_instance"] = merged_params.get("instance", "")
+        state["extracted_job_name"] = merged_params.get("job_name", "")
+        state["extracted_calendar_name"] = merged_params.get("calendar_name", "")
+        state["missing_parameters"] = extraction_result.get("missing_still", [])
+        
+        # Update session context
+        session_manager.update_session_context(session_id, {
+            "user_intent": extraction_result.get("user_intent", ""),
+            "pending_clarification": bool(state["missing_parameters"])
+        })
+        
+        # Store extraction for debugging
+        if "llm_analysis" not in state:
+            state["llm_analysis"] = {}
+        state["llm_analysis"]["extraction_with_memory"] = extraction_result
+        state["llm_analysis"]["merged_params"] = merged_params
+        
+        self.logger.info(f"Session {session_id} - Extracted: {merged_params}, Missing: {state['missing_parameters']}")
+        
+    except Exception as e:
+        self.logger.error(f"Parameter extraction with memory failed: {str(e)}")
+        state["missing_parameters"] = ["extraction_error"]
+        
+    return state
+
+# ============================================================================
+# ENHANCED INTENT ANALYSIS WITH SESSION CONTEXT
+# ============================================================================
+
+def analyze_with_llm_and_context_node(self, state: AutosysState) -> AutosysState:
+    """Analyze intent considering session context"""
+    
+    try:
+        session_id = state["session_id"]
+        session_context = session_manager.get_session_context(session_id)
+        existing_params = session_context.get("extracted_params", {})
+        previous_intent = session_context.get("user_intent", "")
+        
+        analysis_prompt = f"""
+Analyze this user message considering conversation context:
+
+CURRENT MESSAGE: "{state['user_question']}"
+PREVIOUS CONTEXT: {json.dumps(session_context, indent=2, default=str)}
+AVAILABLE INSTANCES: {', '.join(self.db_manager.list_instances())}
+
+Analyze considering:
+1. Is this a continuation of previous conversation?
+2. Is user providing missing information from previous request?
+3. Is this a completely new request?
+4. What is the user's overall intent?
+
+Return ONLY JSON:
+{{
+    "is_general_conversation": false,
+    "is_continuation": true_if_related_to_previous_context,
+    "query_type": "job_details|calendar_details|general_query|clarification_response",
+    "overall_intent": "complete_description_of_what_user_wants",
+    "requires_job_name": true,
+    "requires_calendar_name": false,
+    "requires_instance": true,
+    "confidence_level": "high|medium|low",
+    "reasoning": "explanation_of_analysis"
+}}
+"""
+        
+        response = self.llm.invoke(analysis_prompt)
+        analysis = self._safe_parse_llm_json(response)
+        
+        if not analysis:
+            analysis = {
+                "is_general_conversation": True,
+                "is_continuation": False,
+                "query_type": "general_conversation"
+            }
+        
+        # Update state
+        state["llm_analysis"] = analysis
+        state["is_general_conversation"] = analysis.get("is_general_conversation", False)
+        state["query_type"] = analysis.get("query_type", "general_query")
+        
+        # Update session context with intent
+        session_manager.update_session_context(session_id, {
+            "user_intent": analysis.get("overall_intent", ""),
+            "is_continuation": analysis.get("is_continuation", False)
+        })
+        
+        self.logger.info(f"Session {session_id} - Intent: {analysis.get('query_type')}, Continuation: {analysis.get('is_continuation')}")
+        
+    except Exception as e:
+        self.logger.error(f"Intent analysis with context failed: {str(e)}")
+        state["llm_analysis"] = {"error": str(e)}
+        state["is_general_conversation"] = True
+        
+    return state
+
+# ============================================================================
+# ENHANCED CLARIFICATION WITH CONTEXT AWARENESS
+# ============================================================================
+
+def request_missing_params_with_context_node(self, state: AutosysState) -> AutosysState:
+    """Generate contextual clarification requests"""
+    
+    try:
+        session_id = state["session_id"]
+        session_context = session_manager.get_session_context(session_id)
+        existing_params = session_context.get("extracted_params", {})
+        user_intent = session_context.get("user_intent", "")
+        
+        missing_params = state.get("missing_parameters", [])
+        available_instances = self.db_manager.list_instances()
+        instance_info = self.db_manager.get_instance_info()
+        
+        clarification_prompt = f"""
+Generate a contextual clarification request for missing parameters:
+
+CONTEXT:
+- User's Overall Intent: {user_intent}
+- Current Query: "{state['user_question']}"
+- Already Have: {json.dumps({k: v for k, v in existing_params.items() if v}, indent=2)}
+- Still Missing: {missing_params}
+- Available Instances: {', '.join(available_instances)}
+
+Create a clarification that:
+1. Acknowledges what they already provided
+2. Clearly states what's still needed
+3. Provides relevant examples
+4. Maintains conversational flow
+
+Generate HTML clarification message that feels like a natural conversation.
+Include the instance information and examples.
+
+INSTANCE INFO:
+{instance_info}
+"""
+        
+        response = self.llm.invoke(clarification_prompt)
+        
+        if hasattr(response, 'content'):
+            clarification_html = response.content
+        else:
+            clarification_html = str(response)
+        
+        # Clean HTML markers
+        clarification_html = re.sub(r'```html\s*', '', clarification_html, flags=re.IGNORECASE)
+        clarification_html = re.sub(r'```\s*$', '', clarification_html)
+        
+        # Mark session as pending clarification
+        session_manager.update_session_context(session_id, {
+            "pending_clarification": True
+        })
+        
+        state["formatted_output"] = clarification_html
+        
+        self.logger.info(f"Session {session_id} - Requested clarification for: {missing_params}")
+        
+    except Exception as e:
+        self.logger.error(f"Contextual clarification failed: {e}")
+        # Fallback clarification
+        have_params = [f"{k}: {v}" for k, v in existing_params.items() if v]
+        missing_str = ", ".join(missing_params)
+        
+        state["formatted_output"] = f"""
+        <div style="background: #fff3cd; border: 1px solid #ffeaa7; border-radius: 8px; padding: 15px; margin: 10px 0;">
+            <h4 style="margin: 0 0 10px 0; color: #856404;">Additional Information Needed</h4>
+            <p style="color: #856404;">I have: {', '.join(have_params) if have_params else 'nothing yet'}</p>
+            <p style="color: #856404;">I still need: {missing_str}</p>
+            <div style="background: #f8f9fa; border-radius: 4px; padding: 10px; margin: 10px 0;">
+                <strong>Available Instances:</strong><br>
+                {self.db_manager.get_instance_info()}
+            </div>
+        </div>
+        """
+    
+    return state
+
+# ============================================================================
+# UPDATE MAIN WORKFLOW
+# ============================================================================
+
+def _build_graph_with_memory(self) -> StateGraph:
+    """Build workflow with session memory support"""
+    
+    workflow = StateGraph(AutosysState)
+    
+    # Add nodes with memory support
+    workflow.add_node("analyze_with_context", self.analyze_with_llm_and_context_node)
+    workflow.add_node("handle_conversation", self.handle_conversation_node)
+    workflow.add_node("extract_parameters_with_memory", self.extract_parameters_with_memory_node)
+    workflow.add_node("request_missing_params_with_context", self.request_missing_params_with_context_node)
+    workflow.add_node("generate_sql", self.generate_sql_llm_node)
+    workflow.add_node("execute_query", self.execute_query_node)
+    workflow.add_node("format_results", self.format_results_llm_node)
+    workflow.add_node("handle_error", self.handle_error_llm_node)
+    
+    # Set entry point
+    workflow.set_entry_point("analyze_with_context")
+    
+    # Add conditional routing
+    workflow.add_conditional_edges(
+        "analyze_with_context",
+        self._should_handle_conversation,
+        {
+            "conversation": "handle_conversation",
+            "database": "extract_parameters_with_memory"
+        }
+    )
+    
+    workflow.add_edge("handle_conversation", END)
+    
+    workflow.add_conditional_edges(
+        "extract_parameters_with_memory", 
+        self._needs_parameters,
+        {
+            "needs_params": "request_missing_params_with_context",
+            "has_all_params": "generate_sql"
+        }
+    )
+    
+    workflow.add_edge("request_missing_params_with_context", END)
+    
+    # ... rest of the workflow remains the same
+    
+    return workflow.compile(checkpointer=self.memory)
+
+# ============================================================================
+# USAGE EXAMPLE
+# ============================================================================
+
+"""
+CONVERSATION FLOW WITH MEMORY:
+
+User: "Show job details"
+System: "I need the job name and database instance. Which job would you like details for?"
+
+User: "job ABC123"  
+System: "Thanks! I have job ABC123. Which database instance? (PROD, DEV, TEST)"
+
+User: "PROD"
+System: [Executes query for job ABC123 in PROD instance]
+
+The system remembers "ABC123" from the previous exchange and only asks for the missing instance.
+"""
+
+# ============================================================================
+# INTEGRATION INSTRUCTIONS
+# ============================================================================
+
+"""
+TO ADD SESSION MEMORY TO YOUR EXISTING SYSTEM:
+
+1. Add the SessionContextManager class above your existing code
+
+2. Replace these methods in your LLMDrivenAutosysSystem class:
+   - analyze_with_llm_node → analyze_with_llm_and_context_node
+   - extract_parameters_llm_node → extract_parameters_with_memory_node  
+   - request_missing_params_llm_node → request_missing_params_with_context_node
+   - _build_graph → _build_graph_with_memory
+
+3. Update the method names in your workflow builder
+
+4. Add session cleanup (optional):
+   ```python
+   # Clean up old sessions periodically
+   session_manager.cleanup_old_sessions(max_age_hours=24)
+   ```
+
+KEY BENEFITS:
+- Remembers parameters across conversation turns
+- Natural conversational flow
+- Reduces user frustration with repetitive questions  
+- Maintains context for complex multi-step queries
+- Automatic session cleanup prevents memory leaks
+"""
+
+
+
+&&&&&______&&&&&
+
+
+
+
+
 
 # ============================================================================
 # FIXES FOR STRING INDICES ERROR - KEEP EXISTING FUNCTION/CLASS NAMES
