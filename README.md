@@ -1,3 +1,251 @@
+
+# Fix 1: Improve tool descriptions and naming
+from langchain.tools import tool
+from langchain.agents import initialize_agent, AgentType
+from langchain.chat_models import ChatOpenAI
+from langchain.schema import SystemMessage
+
+@tool
+def get_instance_info(instance_name: str) -> str:
+    """
+    REQUIRED: Get detailed information about a specific server instance.
+    This tool MUST be called when user asks about instance status, details, or information.
+    
+    Args:
+        instance_name: The exact name of the server instance to query
+        
+    Returns:
+        JSON string with instance details including status, version, uptime
+    """
+    # Your actual API call here
+    api_url = f"https://api.example.com/instances/{instance_name}"
+    # return api_response
+    return f"Instance {instance_name}: Status=Active, Version=2.1.4"
+
+# Fix 2: Use explicit tool forcing with bind_tools
+from langchain_openai import ChatOpenAI
+
+llm = ChatOpenAI(model="gpt-4", temperature=0)
+
+# Bind tools to force usage
+tools = [get_instance_info]
+llm_with_tools = llm.bind_tools(tools)
+
+# Fix 3: Create a system prompt that emphasizes tool usage
+SYSTEM_PROMPT = """You are a helpful assistant that manages server instances.
+
+CRITICAL RULES:
+1. You MUST use the get_instance_info tool when users ask about any instance information
+2. NEVER guess or make up instance details
+3. If you don't have information, you MUST call the appropriate tool first
+4. Always call tools before providing any technical information
+
+When a user mentions an instance name, immediately call get_instance_info with that exact name.
+"""
+
+# Fix 4: Use AgentExecutor with tool forcing
+from langchain.agents import create_tool_calling_agent, AgentExecutor
+from langchain_core.prompts import ChatPromptTemplate
+
+prompt = ChatPromptTemplate.from_messages([
+    ("system", SYSTEM_PROMPT),
+    ("user", "{input}"),
+    ("placeholder", "{agent_scratchpad}"),
+])
+
+agent = create_tool_calling_agent(llm, tools, prompt)
+agent_executor = AgentExecutor(
+    agent=agent, 
+    tools=tools, 
+    verbose=True,
+    handle_parsing_errors=True,
+    max_iterations=3  # Limit iterations to prevent loops
+)
+
+# Fix 5: Add tool choice enforcement
+def force_tool_usage(user_input: str):
+    """Force the LLM to use tools for specific queries"""
+    
+    # Keywords that should always trigger tool usage
+    tool_keywords = ['instance', 'server', 'status', 'info', 'details']
+    
+    if any(keyword in user_input.lower() for keyword in tool_keywords):
+        # Add explicit instruction to use tools
+        enhanced_input = f"""
+        {user_input}
+        
+        IMPORTANT: You must use the available tools to get this information. Do not guess or make up any details.
+        """
+        return enhanced_input
+    
+    return user_input
+
+# Fix 6: Use structured output with Pydantic
+from pydantic import BaseModel, Field
+from typing import Optional
+
+class InstanceQuery(BaseModel):
+    instance_name: str = Field(description="The name of the instance to query")
+    action: str = Field(description="The action to perform: 'get_info', 'get_status', etc.")
+
+@tool
+def structured_instance_tool(query: InstanceQuery) -> str:
+    """Get instance information using structured input"""
+    return get_instance_info(query.instance_name)
+
+# Fix 7: Create a chain that always checks tools first
+from langchain.chains import LLMChain
+from langchain.prompts import PromptTemplate
+
+def create_tool_first_chain():
+    prompt = PromptTemplate(
+        input_variables=["user_input", "instance_name"],
+        template="""
+        User question: {user_input}
+        Instance name mentioned: {instance_name}
+        
+        You MUST follow these steps:
+        1. First, call get_instance_info with the instance name: {instance_name}
+        2. Only after getting tool results, answer the user's question
+        3. Base your response entirely on tool results, never guess
+        
+        If no instance name is provided, ask for it before proceeding.
+        """
+    )
+    
+    return LLMChain(llm=llm_with_tools, prompt=prompt)
+
+# Fix 8: Pre-processing to extract instance names
+import re
+
+def extract_instance_name(user_input: str) -> Optional[str]:
+    """Extract instance name from user input"""
+    patterns = [
+        r'instance[:\s]+([a-zA-Z0-9\-_]+)',
+        r'server[:\s]+([a-zA-Z0-9\-_]+)', 
+        r'([a-zA-Z0-9\-_]+)\s+instance',
+        r'([a-zA-Z0-9\-_]+)\s+server'
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, user_input, re.IGNORECASE)
+        if match:
+            return match.group(1)
+    
+    return None
+
+# Fix 9: Complete working example with error handling
+class InstanceManager:
+    def __init__(self):
+        self.llm = ChatOpenAI(model="gpt-4", temperature=0)
+        self.tools = [get_instance_info]
+        self.agent_executor = AgentExecutor(
+            agent=create_tool_calling_agent(self.llm, self.tools, prompt),
+            tools=self.tools,
+            verbose=True,
+            return_intermediate_steps=True,
+            handle_parsing_errors=True
+        )
+    
+    def process_query(self, user_input: str) -> str:
+        try:
+            # Extract instance name
+            instance_name = extract_instance_name(user_input)
+            
+            if not instance_name:
+                return "Please provide an instance name for me to help you."
+            
+            # Force tool usage with explicit instruction
+            enhanced_input = f"""
+            User query: {user_input}
+            Instance name: {instance_name}
+            
+            MANDATORY: Call get_instance_info tool with instance_name="{instance_name}" before answering.
+            """
+            
+            result = self.agent_executor.invoke({"input": enhanced_input})
+            
+            # Check if tools were actually called
+            if not result.get('intermediate_steps'):
+                return "Error: No tools were called. Please try again with a more specific request."
+            
+            return result['output']
+            
+        except Exception as e:
+            return f"Error processing query: {str(e)}"
+
+# Fix 10: Alternative approach with function calling models
+from langchain_openai import ChatOpenAI
+
+def create_function_calling_chain():
+    llm = ChatOpenAI(
+        model="gpt-4",  # Use a model that supports function calling
+        temperature=0,
+        model_kwargs={
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_instance_info",
+                        "description": "Get information about a server instance",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "instance_name": {
+                                    "type": "string",
+                                    "description": "The name of the instance"
+                                }
+                            },
+                            "required": ["instance_name"]
+                        }
+                    }
+                }
+            ],
+            "tool_choice": "auto"  # or "required" to force tool usage
+        }
+    )
+    return llm
+
+# Usage example:
+if __name__ == "__main__":
+    manager = InstanceManager()
+    
+    # Test queries
+    test_queries = [
+        "What's the status of my-server instance?",
+        "Tell me about production-db server",
+        "Get info for test-env instance"
+    ]
+    
+    for query in test_queries:
+        print(f"Query: {query}")
+        response = manager.process_query(query)
+        print(f"Response: {response}\n")
+
+# Fix 11: Debug function to check tool calling
+def debug_tool_calling(agent_executor, query):
+    """Debug helper to see if tools are being called"""
+    result = agent_executor.invoke({"input": query})
+    
+    print("=== DEBUG INFO ===")
+    print(f"Query: {query}")
+    print(f"Tools called: {len(result.get('intermediate_steps', []))}")
+    
+    for i, step in enumerate(result.get('intermediate_steps', [])):
+        action, observation = step
+        print(f"Step {i+1}: {action.tool} with input: {action.tool_input}")
+        print(f"Result: {observation}")
+    
+    print(f"Final output: {result['output']}")
+    print("==================")
+    
+    return result
+
+    
+
+
+
+
 # ============================================================================
 # SESSION MEMORY FOR CONVERSATIONAL CONTEXT
 # ============================================================================
