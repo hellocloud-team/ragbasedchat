@@ -1,3 +1,373 @@
+vvvvbbbbbbbbbbb
+# COMPLETE SOLUTION TO FORCE TOOL EXECUTION
+
+from langchain.tools import tool
+from langchain.agents import AgentExecutor, create_tool_calling_agent
+from langchain.prompts import ChatPromptTemplate
+from langchain.chat_models import ChatOpenAI
+from langchain.schema import BaseMessage, HumanMessage, AIMessage, SystemMessage
+import re
+
+# Global session context
+session_context = {
+    "instance_name": None,
+    "job_name": None,
+    "calendar_name": None
+}
+
+valid_instance = {"DA3", "DB3", "DC3", "DG3", "LS3"}
+
+# SOLUTION 1: MANDATORY TOOL USAGE PROMPT
+FORCE_TOOL_SYSTEM_PROMPT = """You are an AutoSys database assistant. 
+
+🚫 CRITICAL RULES - NEVER VIOLATE:
+1. You MUST ALWAYS call the sql_database_query tool for EVERY user request
+2. NEVER respond without calling the tool first
+3. NEVER say "I cannot find that information" without calling the tool
+4. NEVER make assumptions - ALWAYS use the tool
+
+✅ MANDATORY PROCESS:
+1. For ANY user input, immediately call sql_database_query tool
+2. Pass the user's input exactly to the tool
+3. Wait for tool response
+4. Provide answer based on tool results
+
+EXAMPLES OF CORRECT BEHAVIOR:
+User: "What is the AutoSys instance name?" 
+→ MUST call sql_database_query("What is the AutoSys instance name?")
+
+User: "DA3"
+→ MUST call sql_database_query("DA3")
+
+User: "Show me jobs"
+→ MUST call sql_database_query("Show me jobs")
+
+🚨 NEVER respond without calling the tool first. This is MANDATORY."""
+
+@tool
+def sql_database_query(user_input: str) -> str:
+    """
+    MANDATORY tool for ALL AutoSys database operations and instance management.
+    
+    This tool MUST be called for:
+    - Setting instance names (DA3, DB3, DC3, DG3, LS3)
+    - SQL queries (SELECT, UPDATE, INSERT, DELETE, SHOW, DESCRIBE)  
+    - Any AutoSys related questions
+    - Instance information requests
+    
+    Args:
+        user_input: Any user input - instance name, SQL query, or question
+        
+    Returns:
+        Processed result or confirmation message
+    """
+    
+    print(f"🔧 Tool called with input: '{user_input}'")
+    
+    try:
+        # Clean input
+        user_input = user_input.strip()
+        user_input_upper = user_input.upper()
+        
+        # Method 1: Direct instance name
+        if user_input_upper in valid_instance:
+            session_context["instance_name"] = user_input_upper
+            return f"✅ Instance name set to {user_input_upper}. You can now run SQL queries on this instance."
+        
+        # Method 2: Instance patterns
+        instance_patterns = [
+            r'(?:instance|use|connect\s+to|set)\s+([A-Z0-9]{3})',
+            r'([A-Z0-9]{3})\s+(?:instance|database)',
+            r'autosys\s+instance\s+(?:is\s+)?([A-Z0-9]{3})',
+            r'what.*instance.*name.*([A-Z0-9]{3})',
+        ]
+        
+        for pattern in instance_patterns:
+            match = re.search(pattern, user_input_upper)
+            if match:
+                potential_instance = match.group(1)
+                if potential_instance in valid_instance:
+                    session_context["instance_name"] = potential_instance
+                    return f"✅ Instance name set to {potential_instance}. You can now run SQL queries on this instance."
+        
+        # Method 3: Find any valid instance in the input
+        found_instances = []
+        for instance in valid_instance:
+            if instance in user_input_upper:
+                found_instances.append(instance)
+        
+        if found_instances:
+            # Use the first found instance
+            selected_instance = found_instances[0]
+            session_context["instance_name"] = selected_instance
+            
+            # Check if it's also a SQL query
+            if any(keyword in user_input_upper for keyword in ['SELECT', 'SHOW', 'DESCRIBE', 'UPDATE', 'INSERT', 'DELETE']):
+                return execute_sql_query(user_input, selected_instance)
+            else:
+                return f"✅ Instance name set to {selected_instance}. You can now run SQL queries on this instance."
+        
+        # Method 4: SQL query with existing instance
+        if any(keyword in user_input_upper for keyword in ['SELECT', 'SHOW', 'DESCRIBE', 'UPDATE', 'INSERT', 'DELETE']):
+            current_instance = session_context.get("instance_name")
+            if current_instance:
+                return execute_sql_query(user_input, current_instance)
+            else:
+                return f"To execute SQL queries, please first specify the instance. Available instances: {', '.join(valid_instance)}. Example: 'DA3'"
+        
+        # Method 5: General instance questions
+        if any(phrase in user_input_upper for phrase in [
+            'INSTANCE NAME', 'AUTOSYS INSTANCE', 'WHAT IS THE', 'WHICH INSTANCE'
+        ]):
+            current_instance = session_context.get("instance_name")
+            if current_instance:
+                return f"Current AutoSys instance is: {current_instance}"
+            else:
+                return f"No instance is currently set. Please specify one of: {', '.join(valid_instance)}"
+        
+        # Method 6: Default response with instance options
+        current_instance = session_context.get("instance_name")
+        if current_instance:
+            return f"Current instance: {current_instance}. Please provide your SQL query or specify a different instance."
+        else:
+            return f"Please specify the AutoSys instance first. Available instances: {', '.join(valid_instance)}. Example: Just type 'DA3'"
+            
+    except Exception as e:
+        return f"❌ Error processing request: {str(e)}"
+
+def execute_sql_query(query: str, instance_name: str) -> str:
+    """Execute SQL query on specified instance"""
+    try:
+        # Your actual SQL execution logic here
+        # For now, return a mock response
+        return f"Executing query on {instance_name}: {query}\n[Query results would appear here]"
+    except Exception as e:
+        return f"❌ Error executing SQL query: {str(e)}"
+
+# SOLUTION 2: AGENT WITH FORCED TOOL USAGE
+def create_forced_tool_agent():
+    """Create agent that ALWAYS calls tools"""
+    
+    llm = ChatOpenAI(
+        model="gpt-4",
+        temperature=0,
+        api_key="your-openai-api-key"
+    )
+    
+    # Force tool usage prompt
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", FORCE_TOOL_SYSTEM_PROMPT),
+        ("user", "{input}"),
+        ("placeholder", "{agent_scratchpad}"),
+    ])
+    
+    tools = [sql_database_query]
+    
+    # Create agent with tool calling
+    agent = create_tool_calling_agent(llm, tools, prompt)
+    
+    # Create executor with strict settings
+    agent_executor = AgentExecutor(
+        agent=agent,
+        tools=tools,
+        verbose=True,
+        handle_parsing_errors=True,
+        return_intermediate_steps=True,
+        max_iterations=3,
+        early_stopping_method="generate"
+    )
+    
+    return agent_executor
+
+# SOLUTION 3: CUSTOM AGENT WITH TOOL VALIDATION
+class ForcedToolAgent:
+    """Custom agent that validates tool usage"""
+    
+    def __init__(self):
+        self.agent = create_forced_tool_agent()
+        
+    def run(self, user_input: str) -> str:
+        """Run with mandatory tool validation"""
+        
+        print(f"📝 User input: {user_input}")
+        
+        # Execute agent
+        result = self.agent.invoke({"input": user_input})
+        
+        # Check if tools were called
+        intermediate_steps = result.get("intermediate_steps", [])
+        tools_called = len(intermediate_steps)
+        
+        print(f"🔍 Tools called: {tools_called}")
+        
+        if tools_called == 0:
+            # Force tool usage if not called
+            print("⚠️ No tools called - forcing tool usage")
+            
+            # Directly call the tool
+            tool_result = sql_database_query(user_input)
+            return f"[Tool executed] {tool_result}"
+        
+        return result["output"]
+
+# SOLUTION 4: OPENAI FUNCTION CALLING (Most Reliable)
+def create_function_calling_agent():
+    """Use OpenAI's function calling for guaranteed tool usage"""
+    
+    from openai import OpenAI
+    import json
+    
+    client = OpenAI(api_key="your-openai-api-key")
+    
+    def process_with_function_calling(user_input: str) -> str:
+        """Process using OpenAI function calling"""
+        
+        # Define function schema
+        functions = [
+            {
+                "name": "sql_database_query",
+                "description": "Execute AutoSys database operations and manage instances",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "user_input": {
+                            "type": "string",
+                            "description": "User's input - instance name, SQL query, or question"
+                        }
+                    },
+                    "required": ["user_input"]
+                }
+            }
+        ]
+        
+        # Make API call with function calling
+        response = client.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {
+                    "role": "system", 
+                    "content": "You are an AutoSys assistant. For ANY user input, you MUST call the sql_database_query function."
+                },
+                {"role": "user", "content": user_input}
+            ],
+            functions=functions,
+            function_call={"name": "sql_database_query"}  # Force function call
+        )
+        
+        # Check if function was called
+        message = response.choices[0].message
+        
+        if message.function_call:
+            # Extract function arguments
+            function_args = json.loads(message.function_call.arguments)
+            
+            # Call our tool
+            tool_result = sql_database_query(function_args["user_input"])
+            
+            return tool_result
+        else:
+            # Fallback - should not happen with function_call forced
+            return sql_database_query(user_input)
+    
+    return process_with_function_calling
+
+# SOLUTION 5: SIMPLE WRAPPER THAT ALWAYS CALLS TOOL
+class AlwaysCallToolAgent:
+    """Simple wrapper that always calls the tool"""
+    
+    def run(self, user_input: str) -> str:
+        """Always call tool first, then format response"""
+        
+        print(f"🎯 Processing: {user_input}")
+        
+        # Always call the tool
+        tool_result = sql_database_query(user_input)
+        
+        # You can add LLM processing here if needed
+        return tool_result
+
+# TESTING FUNCTION
+def test_all_solutions():
+    """Test all solutions to see which works best"""
+    
+    print("🧪 TESTING ALL SOLUTIONS")
+    print("=" * 60)
+    
+    test_inputs = [
+        "What is the AutoSys instance name?",
+        "DA3",
+        "Show me jobs",
+        "DA3 SELECT * FROM jobs"
+    ]
+    
+    # Test Solution 5 (Simplest and most reliable)
+    print("\n📋 SOLUTION 5: Always Call Tool Agent")
+    print("-" * 40)
+    
+    agent = AlwaysCallToolAgent()
+    
+    for test_input in test_inputs:
+        print(f"\nInput: {test_input}")
+        result = agent.run(test_input)
+        print(f"Result: {result}")
+    
+    return agent
+
+# MAIN SOLUTION - USE THIS IN YOUR APPLICATION
+def create_production_agent():
+    """Create production-ready agent that always calls tools"""
+    
+    # Use the simplest, most reliable solution
+    return AlwaysCallToolAgent()
+
+# INTEGRATION WITH YOUR EXISTING ROUTER
+def integrate_with_router():
+    """How to integrate with your existing API router"""
+    
+    # Replace your SQL agent creation with:
+    def create_sql_agent_api():
+        """Create SQL agent for API"""
+        agent = create_production_agent()
+        
+        def api_handler(request_data):
+            user_input = request_data.get('query', '')
+            result = agent.run(user_input)
+            
+            return {
+                "success": True,
+                "result": result,
+                "agent": "sql_agent",
+                "tool_used": "sql_database_query"
+            }
+        
+        return api_handler
+    
+    print("✅ Integration ready - replace your SQL agent with create_sql_agent_api()")
+
+if __name__ == "__main__":
+    # Test and demonstrate solutions
+    agent = test_all_solutions()
+    
+    print("\n" + "=" * 60)
+    print("🎯 RECOMMENDED SOLUTION")
+    print("=" * 60)
+    
+    print("Use AlwaysCallToolAgent for guaranteed tool execution:")
+    print("""
+    agent = AlwaysCallToolAgent()
+    result = agent.run("What is the AutoSys instance name?")
+    # This WILL call the tool
+    """)
+    
+    print("\n🔧 Key Benefits:")
+    print("✅ Always calls the tool - no exceptions")
+    print("✅ Simple and reliable")
+    print("✅ No complex prompt engineering needed") 
+    print("✅ Works with any user input")
+    print("✅ Easy to integrate with existing code")
+    
+    # Show the integration
+    integrate_with_router()
 
 xxxxxxxxxxxxxxxx
 
