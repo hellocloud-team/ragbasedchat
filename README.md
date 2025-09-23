@@ -1,3 +1,1826 @@
+###########££££
+import requests
+import re
+from typing import Dict, Any, Optional
+from enum import Enum
+import json
+import asyncio
+import aiohttp
+from dataclasses import dataclass
+
+class AgentAPI(Enum):
+    SQL_AGENT = "sql_agent"
+    TOOLS_AGENT = "tools_agent"
+    UNKNOWN = "unknown"
+
+@dataclass
+class APIConfig:
+    """Configuration for agent APIs"""
+    sql_agent_url: str
+    tools_agent_url: str
+    timeout: int = 30
+    headers: Dict[str, str] = None
+    
+    def __post_init__(self):
+        if self.headers is None:
+            self.headers = {"Content-Type": "application/json"}
+
+class APIAgentRouter:
+    """Routes user queries to appropriate agent APIs"""
+    
+    def __init__(self, config: APIConfig, llm_config: Dict[str, Any] = None):
+        self.config = config
+        self.routing_cache = {}  # Cache for routing decisions
+        self.llm_config = llm_config or {
+            "provider": "openai",  # Options: "openai", "anthropic", "local"
+            "model": "gpt-4",      # or "gpt-3.5-turbo", "claude-3-sonnet", etc.
+            "api_key": None,       # Set your API key
+            "temperature": 0,      # Deterministic routing
+            "max_tokens": 10       # Short responses
+        }
+        self._routing_llm = None
+        
+    def route_and_call(self, user_input: str, user_context: Dict = None) -> Dict[str, Any]:
+        """Route user query and call appropriate API"""
+        
+        try:
+            # Step 1: Determine which API to call
+            agent_type = self._determine_agent(user_input)
+            
+            # Step 2: Prepare request payload
+            payload = self._prepare_payload(user_input, user_context)
+            
+            # Step 3: Call the appropriate API
+            if agent_type == AgentAPI.SQL_AGENT:
+                response = self._call_sql_agent_api(payload)
+            elif agent_type == AgentAPI.TOOLS_AGENT:
+                response = self._call_tools_agent_api(payload)
+            else:
+                response = self._handle_unknown_query(user_input)
+            
+            return {
+                "success": True,
+                "agent_used": agent_type.value,
+                "query": user_input,
+                "response": response,
+                "routing_reason": self._get_routing_reason(agent_type, user_input)
+            }
+            
+        except Exception as e:
+            return {
+                "success": False,
+                "error": str(e),
+                "query": user_input,
+                "agent_used": "error"
+            }
+    
+    def _determine_agent(self, user_input: str, use_llm: bool = True) -> AgentAPI:
+        """Determine which agent API to call using LLM-based routing"""
+        
+        user_input_lower = user_input.lower().strip()
+        
+        # Check cache first (optional optimization)
+        cache_key = hash(user_input_lower)
+        if cache_key in self.routing_cache:
+            return self.routing_cache[cache_key]
+        
+        if use_llm:
+            # Use LLM-based routing (primary method)
+            result = self._llm_based_routing(user_input)
+            
+            # Fallback to rule-based if LLM fails
+            if result == AgentAPI.UNKNOWN:
+                result = self._rule_based_routing(user_input)
+        else:
+            # Use rule-based routing as fallback
+            result = self._rule_based_routing(user_input)
+        
+        # Cache the result
+        self.routing_cache[cache_key] = result
+        return result
+    
+    def _llm_based_routing(self, user_input: str) -> AgentAPI:
+        """Use LLM to determine which agent to route to"""
+        
+        # Different prompt strategies
+        routing_prompt = self._get_routing_prompt(user_input, style="detailed")
+        
+        try:
+            # Initialize LLM if not already done
+            if not self._routing_llm:
+                self._routing_llm = self._initialize_llm()
+            
+            classification = self._call_llm_for_routing(routing_prompt)
+            
+            # Map response to enum
+            if "SQL_AGENT" in classification:
+                return AgentAPI.SQL_AGENT
+            elif "TOOLS_AGENT" in classification:
+                return AgentAPI.TOOLS_AGENT
+            else:
+                return AgentAPI.UNKNOWN
+                
+        except Exception as e:
+            print(f"LLM routing failed: {e}")
+            return AgentAPI.UNKNOWN
+    
+    def _initialize_llm(self):
+        """Initialize LLM based on configuration"""
+        
+        provider = self.llm_config.get("provider", "openai").lower()
+        
+        if provider == "openai":
+            from openai import OpenAI
+            return OpenAI(api_key=self.llm_config.get("api_key"))
+            
+        elif provider == "anthropic":
+            import anthropic
+            return anthropic.Anthropic(api_key=self.llm_config.get("api_key"))
+            
+        elif provider == "gemini":
+            import google.generativeai as genai
+            genai.configure(api_key=self.llm_config.get("api_key"))
+            return genai.GenerativeModel(self.llm_config.get("model", "gemini-pro"))
+            
+        elif provider == "local":
+            # For local LLMs like Ollama, LM Studio, etc.
+            from openai import OpenAI
+            return OpenAI(
+                base_url=self.llm_config.get("base_url", "http://localhost:11434/v1"),
+                api_key="ollama"  # Placeholder for local models
+            )
+        else:
+            raise ValueError(f"Unsupported LLM provider: {provider}")
+    
+    def _call_llm_for_routing(self, prompt: str) -> str:
+        """Call LLM API for routing decision"""
+        
+        provider = self.llm_config.get("provider", "openai").lower()
+        model = self.llm_config.get("model", "gpt-4")
+        
+        if provider == "openai" or provider == "local":
+            response = self._routing_llm.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": "You are a precise query classifier. Respond with only the classification."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=self.llm_config.get("temperature", 0),
+                max_tokens=self.llm_config.get("max_tokens", 10)
+            )
+            return response.choices[0].message.content.strip().upper()
+            
+        elif provider == "anthropic":
+            response = self._routing_llm.messages.create(
+                model=model,
+                max_tokens=self.llm_config.get("max_tokens", 10),
+                temperature=self.llm_config.get("temperature", 0),
+                messages=[{"role": "user", "content": prompt}]
+            )
+            return response.content[0].text.strip().upper()
+        
+        elif provider == "gemini":
+            # Configure generation settings for Gemini
+            generation_config = {
+                "temperature": self.llm_config.get("temperature", 0),
+                "max_output_tokens": self.llm_config.get("max_tokens", 10),
+                "top_p": 0.1,  # Low top_p for deterministic responses
+                "top_k": 1     # Most deterministic setting
+            }
+            
+            response = self._routing_llm.generate_content(
+                prompt,
+                generation_config=generation_config
+            )
+            return response.text.strip().upper()
+        
+        else:
+            raise ValueError(f"Unsupported provider for LLM call: {provider}")
+    
+    def _get_routing_prompt(self, user_input: str, style: str = "detailed") -> str:
+        """Generate routing prompt with different styles"""
+        
+        if style == "simple":
+            return f"""Classify this query as SQL_AGENT (database/data) or TOOLS_AGENT (system/API):
+"{user_input}"
+Response:"""
+        
+        elif style == "detailed":
+            return f"""You are an intelligent query router. Classify user queries into exactly one category:
+
+**SQL_AGENT**: Database operations, data queries, analytics, business intelligence
+- Database queries (SELECT, INSERT, UPDATE, DELETE, CREATE, etc.)
+- Data retrieval and analysis (counts, sums, averages, trends)  
+- Business data questions (users, customers, orders, sales, products)
+- Reporting and analytics requests
+- Data export/visualization requests
+
+**TOOLS_AGENT**: System operations, API calls, infrastructure, process management
+- Server/instance management (status, health checks, monitoring)
+- API endpoints and service calls
+- System operations (start, stop, restart, deploy, configure)
+- File operations (upload, download, copy, move)
+- Process/task execution and workflow management
+- Infrastructure operations (cloud, containers, backups)
+
+Query: "{user_input}"
+Classification:"""
+        
+        elif style == "few_shot":
+            return f"""Classify queries as SQL_AGENT or TOOLS_AGENT:
+
+Examples:
+"Show all users" → SQL_AGENT
+"Check server status" → TOOLS_AGENT  
+"Count orders" → SQL_AGENT
+"Deploy app" → TOOLS_AGENT
+"User analytics" → SQL_AGENT
+"API health check" → TOOLS_AGENT
+
+Query: "{user_input}"
+Classification:"""
+        
+        else:
+            # Default to detailed
+            return self._get_routing_prompt(user_input, "detailed")
+    
+    def _rule_based_routing(self, user_input: str) -> AgentAPI:
+        """Fallback rule-based routing"""
+        
+        user_input_lower = user_input.lower().strip()
+        
+        # SQL Agent patterns - Database related queries
+        sql_patterns = [
+            # Direct SQL keywords
+            r'\b(select|insert|update|delete|create|drop|alter|show|describe)\b',
+            r'\b(database|table|column|row|record|schema|index)\b',
+            r'\b(query|sql|join|where|group by|order by|having)\b',
+            r'\b(count|sum|avg|max|min|distinct|aggregate)\b',
+            
+            # Business data queries
+            r'\b(users?|customers?|orders?|products?|transactions?|sales|revenue)\b.*\b(data|information|details|list|show|get|find)\b',
+            r'\b(how many|total|count of|sum of|average|statistics|analytics|report)\b',
+            r'\b(find|search|get|retrieve|show|list|display)\b.*\b(records?|entries|data|information)\b',
+            r'\b(top|bottom|highest|lowest|best|worst)\b.*\b(customers?|products?|sales)\b',
+            
+            # Data analysis patterns
+            r'\b(analyze|analysis|trend|pattern|insight|metric|kpi)\b',
+            r'\b(dashboard|chart|graph|visualization|export|download)\b.*\b(data)\b',
+        ]
+        
+        # Tools Agent patterns - System/API operations
+        tools_patterns = [
+            # System operations
+            r'\b(server|instance|service|application|system|environment)\b.*\b(status|health|info|details|check|monitor)\b',
+            r'\b(start|stop|restart|deploy|configure|setup|install)\b',
+            r'\b(api|endpoint|service|microservice)\b.*\b(call|invoke|execute|test)\b',
+            r'\b(health check|uptime|performance|metrics|logs|monitoring)\b',
+            
+            # File/Process operations
+            r'\b(file|directory|folder|path|upload|download|copy|move)\b',
+            r'\b(process|task|job|workflow|pipeline|batch)\b.*\b(run|execute|start|trigger)\b',
+            r'\b(configuration|config|settings|parameters|environment variables)\b',
+            
+            # Infrastructure operations
+            r'\b(cloud|aws|azure|gcp|kubernetes|docker|container)\b',
+            r'\b(backup|restore|migrate|sync|replicate)\b',
+            r'\b(alert|notification|email|slack|webhook)\b.*\b(send|trigger|notify)\b',
+        ]
+        
+        # Check SQL patterns first
+        for pattern in sql_patterns:
+            if re.search(pattern, user_input_lower):
+                return AgentAPI.SQL_AGENT
+        
+        # Check Tools patterns
+        for pattern in tools_patterns:
+            if re.search(pattern, user_input_lower):
+                return AgentAPI.TOOLS_AGENT
+        
+        # Default to UNKNOWN if no patterns match
+        return AgentAPI.UNKNOWN
+    
+    def _prepare_payload(self, user_input: str, user_context: Dict = None) -> Dict[str, Any]:
+        """Prepare the API request payload"""
+        
+        payload = {
+            "query": user_input,
+            "timestamp": "2024-01-01T00:00:00Z",  # Replace with actual timestamp
+        }
+        
+        if user_context:
+            payload["context"] = user_context
+            
+        return payload
+    
+    def _call_sql_agent_api(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Call the SQL Agent API"""
+        
+        try:
+            response = requests.post(
+                self.config.sql_agent_url,
+                json=payload,
+                headers=self.config.headers,
+                timeout=self.config.timeout
+            )
+            response.raise_for_status()
+            
+            return {
+                "status_code": response.status_code,
+                "data": response.json(),
+                "api_endpoint": self.config.sql_agent_url
+            }
+            
+        except requests.exceptions.Timeout:
+            raise Exception(f"SQL Agent API timeout after {self.config.timeout}s")
+        except requests.exceptions.ConnectionError:
+            raise Exception("Failed to connect to SQL Agent API")
+        except requests.exceptions.HTTPError as e:
+            raise Exception(f"SQL Agent API error: {e.response.status_code} - {e.response.text}")
+        except Exception as e:
+            raise Exception(f"SQL Agent API call failed: {str(e)}")
+    
+    def _call_tools_agent_api(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Call the Tools Agent API"""
+        
+        try:
+            response = requests.post(
+                self.config.tools_agent_url,
+                json=payload,
+                headers=self.config.headers,
+                timeout=self.config.timeout
+            )
+            response.raise_for_status()
+            
+            return {
+                "status_code": response.status_code,
+                "data": response.json(),
+                "api_endpoint": self.config.tools_agent_url
+            }
+            
+        except requests.exceptions.Timeout:
+            raise Exception(f"Tools Agent API timeout after {self.config.timeout}s")
+        except requests.exceptions.ConnectionError:
+            raise Exception("Failed to connect to Tools Agent API")
+        except requests.exceptions.HTTPError as e:
+            raise Exception(f"Tools Agent API error: {e.response.status_code} - {e.response.text}")
+        except Exception as e:
+            raise Exception(f"Tools Agent API call failed: {str(e)}")
+    
+    def _handle_unknown_query(self, user_input: str) -> Dict[str, Any]:
+        """Handle queries that don't match any agent"""
+        
+        return {
+            "status_code": 200,
+            "data": {
+                "message": "I'm not sure which system can help with that request. Please try:",
+                "suggestions": [
+                    "For database queries: 'Show me all users' or 'Count total orders'",
+                    "For system operations: 'Check server status' or 'Get instance info'"
+                ],
+                "query": user_input
+            },
+            "api_endpoint": "router"
+        }
+    
+    def _get_routing_reason(self, agent_type: AgentAPI, user_input: str) -> str:
+        """Get explanation for routing decision"""
+        
+        if agent_type == AgentAPI.SQL_AGENT:
+            return "Routed to SQL Agent: Query appears to be database/data related"
+        elif agent_type == AgentAPI.TOOLS_AGENT:
+            return "Routed to Tools Agent: Query appears to be system/API operation related"
+        else:
+            return "Could not determine appropriate agent for this query"
+
+# Async version for better performance
+class AsyncAPIAgentRouter(APIAgentRouter):
+    """Async version of API router for better performance"""
+    
+    async def route_and_call_async(self, user_input: str, user_context: Dict = None) -> Dict[str, Any]:
+        """Async version of route_and_call"""
+        
+        try:
+            agent_type = self._determine_agent(user_input)
+            payload = self._prepare_payload(user_input, user_context)
+            
+            async with aiohttp.ClientSession() as session:
+                if agent_type == AgentAPI.SQL_AGENT:
+                    response = await self._call_sql_agent_async(session, payload)
+                elif agent_type == AgentAPI.TOOLS_AGENT:
+                    response = await self._call_tools_agent_async(session, payload)
+                else:
+                    response = self._handle_unknown_query(user_input)
+            
+            return {
+                "success": True,
+                "agent_used": agent_type.value,
+                "query": user_input,
+                "response": response,
+                "routing_reason": self._get_routing_reason(agent_type, user_input)
+            }
+            
+        except Exception as e:
+            return {
+                "success": False,
+                "error": str(e),
+                "query": user_input,
+                "agent_used": "error"
+            }
+    
+    async def _call_sql_agent_async(self, session: aiohttp.ClientSession, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Async call to SQL Agent API"""
+        
+        async with session.post(
+            self.config.sql_agent_url,
+            json=payload,
+            headers=self.config.headers,
+            timeout=aiohttp.ClientTimeout(total=self.config.timeout)
+        ) as response:
+            response.raise_for_status()
+            data = await response.json()
+            
+            return {
+                "status_code": response.status,
+                "data": data,
+                "api_endpoint": self.config.sql_agent_url
+            }
+    
+    async def _call_tools_agent_async(self, session: aiohttp.ClientSession, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Async call to Tools Agent API"""
+        
+        async with session.post(
+            self.config.tools_agent_url,
+            json=payload,
+            headers=self.config.headers,
+            timeout=aiohttp.ClientTimeout(total=self.config.timeout)
+        ) as response:
+            response.raise_for_status()
+            data = await response.json()
+            
+            return {
+                "status_code": response.status,
+                "data": data,
+                "api_endpoint": self.config.tools_agent_url
+            }
+
+# Flask integration example
+from flask import Flask, request, jsonify
+
+def create_flask_app():
+    app = Flask(__name__)
+    
+    # Initialize router with your API endpoints
+    config = APIConfig(
+        sql_agent_url="http://localhost:8001/sql-agent",  # Your SQL Agent API
+        tools_agent_url="http://localhost:8002/tools-agent",  # Your Tools Agent API
+        timeout=30,
+        headers={"Content-Type": "application/json", "Authorization": "Bearer your-token"}
+    )
+    router = APIAgentRouter(config)
+    
+    @app.route('/chat', methods=['POST'])
+    def chat():
+        try:
+            data = request.json
+            user_input = data.get('message', '').strip()
+            user_context = data.get('context', {})
+            
+            if not user_input:
+                return jsonify({"error": "No message provided"}), 400
+            
+            # Route and call appropriate API
+            result = router.route_and_call(user_input, user_context)
+            
+            return jsonify(result)
+            
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route('/health', methods=['GET'])
+    def health():
+        return jsonify({
+            "status": "healthy",
+            "available_agents": ["sql_agent", "tools_agent"],
+            "endpoints": {
+                "sql_agent": config.sql_agent_url,
+                "tools_agent": config.tools_agent_url
+            }
+        })
+    
+# Performance monitoring and analytics for LLM routing
+class RoutingAnalytics:
+    """Track routing performance and accuracy"""
+    
+    def __init__(self):
+        self.routing_history = []
+        self.accuracy_metrics = {
+            "llm_routing": {"correct": 0, "total": 0},
+            "rule_routing": {"correct": 0, "total": 0}
+        }
+    
+    def log_routing_decision(self, query: str, llm_decision: str, rule_decision: str, actual_success: bool, response_time: float):
+        """Log routing decision for analysis"""
+        entry = {
+            "query": query,
+            "llm_decision": llm_decision,
+            "rule_decision": rule_decision,
+            "actual_success": actual_success,
+            "response_time": response_time,
+            "timestamp": "2024-01-01T00:00:00Z"  # Replace with actual timestamp
+        }
+        self.routing_history.append(entry)
+        
+        # Update accuracy metrics (simplified - in reality you'd need ground truth)
+        if actual_success:
+            self.accuracy_metrics["llm_routing"]["correct"] += 1
+        self.accuracy_metrics["llm_routing"]["total"] += 1
+    
+    def get_routing_stats(self) -> Dict[str, Any]:
+        """Get routing performance statistics"""
+        total_routes = len(self.routing_history)
+        if total_routes == 0:
+            return {"message": "No routing data available"}
+        
+        # Calculate agreement between LLM and rule-based routing
+        agreements = sum(1 for entry in self.routing_history 
+                        if entry["llm_decision"] == entry["rule_decision"])
+        
+        # Calculate average response time
+        avg_response_time = sum(entry["response_time"] for entry in self.routing_history) / total_routes
+        
+        return {
+            "total_queries": total_routes,
+            "llm_rule_agreement": f"{(agreements/total_routes)*100:.1f}%",
+            "avg_response_time": f"{avg_response_time:.2f}s",
+            "success_rate": f"{sum(1 for entry in self.routing_history if entry['actual_success'])/total_routes*100:.1f}%",
+            "routing_distribution": {
+                "sql_agent": sum(1 for entry in self.routing_history if entry["llm_decision"] == "sql_agent"),
+                "tools_agent": sum(1 for entry in self.routing_history if entry["llm_decision"] == "tools_agent"),
+                "unknown": sum(1 for entry in self.routing_history if entry["llm_decision"] == "unknown")
+            }
+        }
+
+# Enhanced router with analytics and confidence scoring
+class EnhancedAPIAgentRouter(APIAgentRouter):
+    """Enhanced router with confidence scoring and analytics"""
+    
+    def __init__(self, config: APIConfig, llm_config: Dict[str, Any] = None):
+        super().__init__(config, llm_config)
+        self.analytics = RoutingAnalytics()
+        self.confidence_threshold = 0.8  # Minimum confidence for LLM routing
+    
+    def route_with_confidence(self, user_input: str, user_context: Dict = None) -> Dict[str, Any]:
+        """Route with confidence scoring"""
+        import time
+        start_time = time.time()
+        
+        try:
+            # Get both LLM and rule-based decisions
+            llm_decision = self._llm_based_routing(user_input)
+            rule_decision = self._rule_based_routing(user_input) 
+            
+            # Calculate confidence based on agreement and other factors
+            confidence = self._calculate_confidence(user_input, llm_decision, rule_decision)
+            
+            # Choose final decision based on confidence
+            if confidence >= self.confidence_threshold:
+                final_decision = llm_decision
+                routing_method = "llm_high_confidence"
+            elif llm_decision == rule_decision:
+                final_decision = llm_decision
+                routing_method = "llm_rule_agreement"
+            else:
+                # Fall back to rule-based if low confidence and disagreement
+                final_decision = rule_decision
+                routing_method = "rule_fallback"
+            
+            # Prepare payload and make API call
+            payload = self._prepare_payload(user_input, user_context)
+            
+            if final_decision == AgentAPI.SQL_AGENT:
+                response = self._call_sql_agent_api(payload)
+            elif final_decision == AgentAPI.TOOLS_AGENT:
+                response = self._call_tools_agent_api(payload)
+            else:
+                response = self._handle_unknown_query(user_input)
+            
+            response_time = time.time() - start_time
+            success = True
+            
+            # Log for analytics
+            self.analytics.log_routing_decision(
+                user_input, llm_decision.value, rule_decision.value, success, response_time
+            )
+            
+            return {
+                "success": True,
+                "agent_used": final_decision.value,
+                "query": user_input,
+                "response": response,
+                "confidence": confidence,
+                "routing_method": routing_method,
+                "llm_decision": llm_decision.value,
+                "rule_decision": rule_decision.value,
+                "response_time": f"{response_time:.2f}s"
+            }
+            
+        except Exception as e:
+            response_time = time.time() - start_time
+            self.analytics.log_routing_decision(
+                user_input, "error", "error", False, response_time
+            )
+            
+            return {
+                "success": False,
+                "error": str(e),
+                "query": user_input,
+                "agent_used": "error",
+                "response_time": f"{response_time:.2f}s"
+            }
+    
+    def _calculate_confidence(self, user_input: str, llm_decision: AgentAPI, rule_decision: AgentAPI) -> float:
+        """Calculate confidence score for routing decision"""
+        
+        confidence = 0.5  # Base confidence
+        
+        # Factor 1: Agreement between LLM and rules (high confidence)
+        if llm_decision == rule_decision and llm_decision != AgentAPI.UNKNOWN:
+            confidence += 0.4
+        
+        # Factor 2: Query clarity (simple patterns get higher confidence)
+        clarity_patterns = [
+            r'\b(select|insert|update|delete)\b',  # Clear SQL
+            r'\b(server|instance).*\b(status|health)\b',  # Clear system ops
+            r'\b(users?|orders?|customers?)\b',  # Clear data queries
+        ]
+        
+        for pattern in clarity_patterns:
+            if re.search(pattern, user_input.lower()):
+                confidence += 0.2
+                break
+        
+        # Factor 3: Query length and complexity (shorter = more confident)
+        word_count = len(user_input.split())
+        if word_count <= 5:
+            confidence += 0.1
+        elif word_count > 15:
+            confidence -= 0.1
+        
+        # Factor 4: Historical accuracy (if available)
+        # This would use historical data to boost confidence
+        
+        return min(confidence, 1.0)  # Cap at 1.0
+    
+    def get_analytics(self) -> Dict[str, Any]:
+        """Get routing analytics"""
+        return self.analytics.get_routing_stats()
+
+# Complete production-ready setup with all LLM providers
+def create_production_router(provider: str = "openai") -> EnhancedAPIAgentRouter:
+    """Create production-ready router with specified LLM provider"""
+    
+    # API configuration
+    api_config = APIConfig(
+        sql_agent_url="http://localhost:8001/sql-agent",     # Your actual endpoints
+        tools_agent_url="http://localhost:8002/tools-agent",
+        timeout=30,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": "Bearer your-api-token"  # If needed
+        }
+    )
+    
+    # LLM configurations for different providers
+    llm_configs = {
+        "openai": {
+            "provider": "openai",
+            "model": "gpt-4-turbo-preview",  # Latest model
+            "api_key": "your-openai-api-key",  # Set from environment variable
+            "temperature": 0,
+            "max_tokens": 10
+        },
+        
+        "openai_fast": {
+            "provider": "openai", 
+            "model": "gpt-3.5-turbo",  # Faster and cheaper
+            "api_key": "your-openai-api-key",
+            "temperature": 0,
+            "max_tokens": 10
+        },
+        
+        "anthropic": {
+            "provider": "anthropic",
+            "model": "claude-3-sonnet-20240229",
+            "api_key": "your-anthropic-api-key",
+            "temperature": 0,
+            "max_tokens": 10
+        },
+        
+        "gemini": {
+            "provider": "gemini",
+            "model": "gemini-pro",  # or "gemini-1.5-pro" for latest
+            "api_key": "your-google-api-key",
+            "temperature": 0,
+            "max_tokens": 10
+        },
+        
+        "gemini_flash": {
+            "provider": "gemini",
+            "model": "gemini-1.5-flash",  # Faster and cheaper option
+            "api_key": "your-google-api-key", 
+            "temperature": 0,
+            "max_tokens": 10
+        },
+        
+        "local_ollama": {
+            "provider": "local",
+            "model": "llama2",  # or "mistral", "codellama"
+            "base_url": "http://localhost:11434/v1",
+            "temperature": 0,
+            "max_tokens": 10
+        },
+        
+        "local_lmstudio": {
+            "provider": "local",
+            "model": "any-local-model",
+            "base_url": "http://localhost:1234/v1",  # LM Studio default
+            "temperature": 0,
+            "max_tokens": 10
+        }
+    }
+    
+    if provider not in llm_configs:
+        raise ValueError(f"Unsupported provider: {provider}. Choose from {list(llm_configs.keys())}")
+    
+    return EnhancedAPIAgentRouter(api_config, llm_configs[provider])
+
+# Environment variable setup helper
+def setup_environment_variables():
+    """Helper to set up environment variables for API keys"""
+    import os
+    
+    required_vars = {
+        "OPENAI_API_KEY": "your-openai-api-key",
+        "ANTHROPIC_API_KEY": "your-anthropic-api-key",
+        "GOOGLE_API_KEY": "your-google-gemini-api-key",
+        "SQL_AGENT_URL": "http://localhost:8001/sql-agent",
+        "TOOLS_AGENT_URL": "http://localhost:8002/tools-agent",
+    }
+    
+    print("Environment Variable Setup:")
+    print("=" * 40)
+    
+    for var_name, example in required_vars.items():
+        current_value = os.getenv(var_name, "Not set")
+        print(f"{var_name}: {current_value}")
+        if current_value == "Not set":
+            print(f"  → Set with: export {var_name}={example}")
+    
+    print("\nExample .env file content:")
+    print("-" * 25)
+    for var_name, example in required_vars.items():
+        print(f"{var_name}={example}")
+
+# Complete usage example with all features
+if __name__ == "__main__":
+    # Setup environment check
+    print("Checking environment setup...")
+    setup_environment_variables()
+    print("\n" + "="*60 + "\n")
+    
+    # Create enhanced router (choose your provider)
+    try:
+        router = create_production_router("openai")  # or "anthropic", "local_ollama"
+        print("✅ Router initialized successfully")
+    except Exception as e:
+        print(f"❌ Router initialization failed: {e}")
+        print("Falling back to rule-based routing only...")
+        # Create basic router without LLM
+        api_config = APIConfig(
+            sql_agent_url="http://localhost:8001/sql-agent",
+            tools_agent_url="http://localhost:8002/tools-agent"
+        )
+        router = APIAgentRouter(api_config, llm_config={"provider": "none"})
+    
+    # Enhanced test queries
+    test_queries = [
+        # Clear SQL queries
+        "Show me all users in the database",
+        "Count total orders for this month", 
+        "Find customers with highest revenue",
+        "Generate sales report for Q4",
+        
+        # Clear system queries
+        "Get the server status for production",
+        "Execute health check on my-instance", 
+        "Deploy the latest version to staging",
+        "Backup database and upload to S3",
+        
+        # Ambiguous queries (where LLM shines)
+        "I need to analyze user behavior patterns",
+        "Can you help me troubleshoot the API issues?",
+        "Show me the performance metrics from yesterday",
+        "Process the pending batch jobs",
+        
+        # Edge cases
+        "What's the weather today?",
+        "Hello, how are you?",
+        ""
+    ]
+    
+    print("Testing Enhanced LLM-Based Router...")
+    print("=" * 60)
+    
+    for i, query in enumerate(test_queries, 1):
+        if not query.strip():
+            continue
+            
+        print(f"\n{i}. Query: '{query}'")
+        print("-" * 50)
+        
+        try:
+            # Use enhanced routing with confidence scoring
+            if hasattr(router, 'route_with_confidence'):
+                result = router.route_with_confidence(query)
+                
+                print(f"✅ Success: {result['success']}")
+                print(f"🤖 Agent: {result.get('agent_used', 'N/A')}")
+                print(f"🎯 Confidence: {result.get('confidence', 'N/A'):.2f}")
+                print(f"📊 Method: {result.get('routing_method', 'N/A')}")
+                print(f"🧠 LLM Decision: {result.get('llm_decision', 'N/A')}")
+                print(f"📋 Rule Decision: {result.get('rule_decision', 'N/A')}")
+                print(f"⏱️  Response Time: {result.get('response_time', 'N/A')}")
+                
+            else:
+                # Fallback to basic routing
+                result = router.route_and_call(query)
+                print(f"✅ Success: {result['success']}")
+                print(f"🤖 Agent: {result.get('agent_used', 'N/A')}")
+            
+        except Exception as e:
+            print(f"❌ Exception: {str(e)}")
+    
+    # Show analytics if available
+    if hasattr(router, 'get_analytics'):
+        print("\n" + "="*60)
+        print("ROUTING ANALYTICS")
+        print("="*60)
+        analytics = router.get_analytics()
+        for key, value in analytics.items():
+            print(f"{key}: {value}")
+
+# Async support for Gemini
+class AsyncEnhancedAPIAgentRouter(EnhancedAPIAgentRouter):
+    """Async version with Gemini support"""
+    
+    async def _call_llm_for_routing_async(self, prompt: str) -> str:
+        """Async LLM call for routing decision"""
+        
+        provider = self.llm_config.get("provider", "openai").lower()
+        model = self.llm_config.get("model", "gpt-4")
+        
+        if provider == "openai" or provider == "local":
+            import asyncio
+            # Use asyncio to run sync OpenAI calls
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(
+                None, 
+                lambda: self._routing_llm.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": "You are a precise query classifier."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=self.llm_config.get("temperature", 0),
+                    max_tokens=self.llm_config.get("max_tokens", 10)
+                )
+            )
+            return response.choices[0].message.content.strip().upper()
+            
+        elif provider == "anthropic":
+            import asyncio
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(
+                None,
+                lambda: self._routing_llm.messages.create(
+                    model=model,
+                    max_tokens=self.llm_config.get("max_tokens", 10),
+                    temperature=self.llm_config.get("temperature", 0),
+                    messages=[{"role": "user", "content": prompt}]
+                )
+            )
+            return response.content[0].text.strip().upper()
+        
+        elif provider == "gemini":
+            import asyncio
+            generation_config = {
+                "temperature": self.llm_config.get("temperature", 0),
+                "max_output_tokens": self.llm_config.get("max_tokens", 10),
+                "top_p": 0.1,
+                "top_k": 1
+            }
+            
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(
+                None,
+                lambda: self._routing_llm.generate_content(
+                    prompt,
+                    generation_config=generation_config
+                )
+            )
+            return response.text.strip().upper()
+        
+        else:
+            raise ValueError(f"Unsupported provider for async LLM call: {provider}")
+
+# Gemini-specific optimizations and prompts
+class GeminiOptimizedRouter(EnhancedAPIAgentRouter):
+    """Router optimized specifically for Google Gemini"""
+    
+    def _get_gemini_optimized_prompt(self, user_input: str) -> str:
+        """Gemini-optimized routing prompt"""
+        
+        return f"""Task: Classify the following user query into exactly one category.
+
+Categories:
+1. SQL_AGENT - For database queries, data analysis, business intelligence
+   • Keywords: select, database, users, customers, orders, count, sum, analytics
+   • Examples: "Show all users", "Count orders", "Sales report"
+
+2. TOOLS_AGENT - For system operations, API calls, infrastructure management  
+   • Keywords: server, instance, status, deploy, API, health, backup
+   • Examples: "Server status", "Deploy app", "API health check"
+
+User Query: "{user_input}"
+
+Instructions:
+- Analyze the query carefully
+- Consider the intent and context
+- Respond with ONLY: SQL_AGENT or TOOLS_AGENT or UNKNOWN
+- Do not include explanations
+
+Classification:"""
+    
+    def _llm_based_routing(self, user_input: str) -> AgentAPI:
+        """Gemini-optimized routing"""
+        
+        if self.llm_config.get("provider") == "gemini":
+            # Use Gemini-optimized prompt
+            routing_prompt = self._get_gemini_optimized_prompt(user_input)
+        else:
+            # Use standard prompt for other providers
+            routing_prompt = self._get_routing_prompt(user_input, style="detailed")
+        
+        try:
+            if not self._routing_llm:
+                self._routing_llm = self._initialize_llm()
+            
+            classification = self._call_llm_for_routing(routing_prompt)
+            
+            # Map response to enum
+            if "SQL_AGENT" in classification:
+                return AgentAPI.SQL_AGENT
+            elif "TOOLS_AGENT" in classification:
+                return AgentAPI.TOOLS_AGENT
+            else:
+                return AgentAPI.UNKNOWN
+                
+        except Exception as e:
+            print(f"LLM routing failed: {e}")
+            return AgentAPI.UNKNOWN
+
+# Installation and setup helper for Gemini
+def setup_gemini_requirements():
+    """Helper function to show Gemini setup requirements"""
+    
+    setup_info = """
+    GOOGLE GEMINI SETUP
+    ==================
+    
+    1. Install Google AI Python SDK:
+       pip install google-generativeai
+    
+    2. Get API Key:
+       - Go to: https://makersuite.google.com/app/apikey
+       - Create a new API key
+       - Set environment variable: GOOGLE_API_KEY=your-key
+    
+    3. Available Models:
+       - gemini-pro: Best accuracy, higher cost
+       - gemini-1.5-pro: Latest model with longer context
+       - gemini-1.5-flash: Faster and cheaper option
+    
+    4. Test your setup:
+       ```python
+       import google.generativeai as genai
+       genai.configure(api_key="your-api-key")
+       model = genai.GenerativeModel('gemini-pro')
+       response = model.generate_content("Hello")
+       print(response.text)
+       ```
+    
+    5. Pricing (as of 2024):
+       - gemini-pro: Free tier available, then pay-per-use
+       - gemini-1.5-flash: Optimized for speed and cost
+    """
+    
+    print(setup_info)
+    
+    # Check if Gemini is properly installed
+    try:
+        import google.generativeai as genai
+        print("✅ google-generativeai package is installed")
+        
+        import os
+        api_key = os.getenv("GOOGLE_API_KEY")
+        if api_key:
+            print("✅ GOOGLE_API_KEY environment variable is set")
+            
+            # Test connection
+            try:
+                genai.configure(api_key=api_key)
+                model = genai.GenerativeModel('gemini-pro')
+                response = model.generate_content("Test")
+                print("✅ Gemini API connection successful")
+            except Exception as e:
+                print(f"❌ Gemini API connection failed: {e}")
+        else:
+            print("❌ GOOGLE_API_KEY environment variable not set")
+            
+    except ImportError:
+        print("❌ google-generativeai package not installed")
+        print("   Run: pip install google-generativeai")
+
+# Complete Gemini example
+def create_gemini_router_example():
+    """Complete example using Gemini for routing"""
+    
+    import os
+    
+    # Check setup
+    if not os.getenv("GOOGLE_API_KEY"):
+        print("Please set GOOGLE_API_KEY environment variable")
+        return None
+    
+    # API configuration
+    api_config = APIConfig(
+        sql_agent_url=os.getenv("SQL_AGENT_URL", "http://localhost:8001/sql-agent"),
+        tools_agent_url=os.getenv("TOOLS_AGENT_URL", "http://localhost:8002/tools-agent"),
+        timeout=30
+    )
+    
+    # Gemini configuration
+    gemini_config = {
+        "provider": "gemini",
+        "model": "gemini-pro",  # or "gemini-1.5-flash" for speed
+        "api_key": os.getenv("GOOGLE_API_KEY"),
+        "temperature": 0,
+        "max_tokens": 10
+    }
+    
+    # Create optimized router
+    router = GeminiOptimizedRouter(api_config, gemini_config)
+    
+    print("🚀 Gemini Router initialized successfully!")
+    return router
+
+    # Try the router with enhanced routing
+    try:
+        router = create_gemini_router_example()
+        if router:
+            print("Testing Gemini router...")
+            
+            test_queries = [
+                "Show me all customers from the database",
+                "Check the health status of production server",
+                "Generate a monthly sales report",
+                "Deploy the latest version to staging environment"
+            ]
+            
+            for query in test_queries:
+                print(f"\nQuery: {query}")
+                result = router.route_with_confidence(query)
+                print(f"Agent: {result['agent_used']}")
+                print(f"Confidence: {result.get('confidence', 'N/A'):.2f}")
+                print(f"Method: {result.get('routing_method', 'N/A')}")
+    
+    except Exception as e:
+        print(f"Gemini router test failed: {e}")
+        print("Please check your setup and try again.")
+
+# Production-ready Flask app that works with your exposed APIs
+def create_production_flask_app():
+    """Production Flask app that integrates with your actual agent APIs"""
+    
+    app = Flask(__name__)
+    
+    # Configuration from environment variables (recommended for production)
+    import os
+    
+    api_config = APIConfig(
+        sql_agent_url=os.getenv("SQL_AGENT_URL", "http://localhost:8001/api/sql-query"),
+        tools_agent_url=os.getenv("TOOLS_AGENT_URL", "http://localhost:8002/api/tools-execute"),
+        timeout=int(os.getenv("API_TIMEOUT", "30")),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {os.getenv('API_TOKEN', '')}" if os.getenv('API_TOKEN') else {"Content-Type": "application/json"}
+        }
+    )
+    
+    # LLM configuration (choose your provider)
+    llm_config = {
+        "provider": os.getenv("LLM_PROVIDER", "gemini").lower(),
+        "model": os.getenv("LLM_MODEL", "gemini-pro"),
+        "api_key": os.getenv("GOOGLE_API_KEY") or os.getenv("OPENAI_API_KEY") or os.getenv("ANTHROPIC_API_KEY"),
+        "temperature": 0,
+        "max_tokens": 10
+    }
+    
+    # Initialize router
+    try:
+        if llm_config["provider"] == "gemini":
+            router = GeminiOptimizedRouter(api_config, llm_config)
+        else:
+            router = EnhancedAPIAgentRouter(api_config, llm_config)
+        app.logger.info(f"✅ Router initialized with {llm_config['provider']} LLM")
+    except Exception as e:
+        # Fallback to rule-based routing if LLM initialization fails
+        router = APIAgentRouter(api_config)
+        app.logger.warning(f"⚠️ LLM initialization failed, using rule-based routing: {e}")
+    
+    @app.route('/health', methods=['GET'])
+    def health():
+        """Health check endpoint"""
+        return jsonify({
+            "status": "healthy",
+            "router_type": type(router).__name__,
+            "llm_provider": llm_config.get("provider", "none"),
+            "agent_endpoints": {
+                "sql_agent": api_config.sql_agent_url,
+                "tools_agent": api_config.tools_agent_url
+            },
+            "timestamp": "2024-01-01T00:00:00Z"  # Replace with actual timestamp
+        })
+    
+    @app.route('/test-agents', methods=['GET'])
+    def test_agents():
+        """Test connectivity to both agent APIs"""
+        results = {}
+        
+        # Test SQL Agent API
+        try:
+            test_payload = {"query": "SELECT 1 as test", "test_mode": True}
+            response = requests.post(
+                api_config.sql_agent_url,
+                json=test_payload,
+                headers=api_config.headers,
+                timeout=5
+            )
+            results['sql_agent'] = {
+                "status": "✅ Connected",
+                "status_code": response.status_code,
+                "url": api_config.sql_agent_url
+            }
+        except Exception as e:
+            results['sql_agent'] = {
+                "status": "❌ Failed",
+                "error": str(e),
+                "url": api_config.sql_agent_url
+            }
+        
+        # Test Tools Agent API
+        try:
+            test_payload = {"query": "health check", "test_mode": True}
+            response = requests.post(
+                api_config.tools_agent_url,
+                json=test_payload,
+                headers=api_config.headers,
+                timeout=5
+            )
+            results['tools_agent'] = {
+                "status": "✅ Connected", 
+                "status_code": response.status_code,
+                "url": api_config.tools_agent_url
+            }
+        except Exception as e:
+            results['tools_agent'] = {
+                "status": "❌ Failed",
+                "error": str(e),
+                "url": api_config.tools_agent_url
+            }
+        
+        return jsonify(results)
+    
+    @app.route('/chat', methods=['POST'])
+    def chat():
+        """Main chat endpoint that routes to appropriate agent API"""
+        
+        try:
+            data = request.json
+            if not data:
+                return jsonify({"error": "No JSON data provided"}), 400
+            
+            user_input = data.get('message', '').strip()
+            user_context = data.get('context', {})
+            
+            if not user_input:
+                return jsonify({"error": "No message provided"}), 400
+            
+            # Log the request
+            app.logger.info(f"Chat request: {user_input}")
+            
+            # Route and call appropriate API
+            if hasattr(router, 'route_with_confidence'):
+                result = router.route_with_confidence(user_input, user_context)
+            else:
+                result = router.route_and_call(user_input, user_context)
+            
+            # Log the result
+            app.logger.info(f"Routed to: {result.get('agent_used', 'unknown')}")
+            
+            return jsonify(result)
+            
+        except requests.exceptions.RequestException as e:
+            error_msg = f"Agent API request failed: {str(e)}"
+            app.logger.error(error_msg)
+            return jsonify({
+                "success": False,
+                "error": error_msg,
+                "error_type": "api_request_failed"
+            }), 503
+            
+        except Exception as e:
+            error_msg = f"Unexpected error: {str(e)}"
+            app.logger.error(error_msg)
+            return jsonify({
+                "success": False,
+                "error": error_msg,
+                "error_type": "internal_error"
+            }), 500
+    
+    @app.route('/route-test', methods=['POST'])
+    def route_test():
+        """Test routing without calling actual APIs"""
+        
+        try:
+            data = request.json
+            query = data.get('query', '')
+            
+            if not query:
+                return jsonify({"error": "No query provided"}), 400
+            
+            # Test routing decision only
+            agent_decision = router._determine_agent(query)
+            
+            # Get routing explanations
+            routing_info = {
+                "query": query,
+                "routed_to": agent_decision.value,
+                "reasoning": router._get_routing_reason(agent_decision, query)
+            }
+            
+            # If enhanced router, get additional info
+            if hasattr(router, '_llm_based_routing'):
+                try:
+                    llm_decision = router._llm_based_routing(query)
+                    rule_decision = router._rule_based_routing(query)
+                    
+                    routing_info.update({
+                        "llm_decision": llm_decision.value,
+                        "rule_decision": rule_decision.value,
+                        "decisions_agree": llm_decision == rule_decision
+                    })
+                except Exception as e:
+                    routing_info["routing_error"] = str(e)
+            
+            return jsonify(routing_info)
+            
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route('/analytics', methods=['GET'])
+    def analytics():
+        """Get routing analytics if available"""
+        
+        if hasattr(router, 'get_analytics'):
+            return jsonify(router.get_analytics())
+        else:
+            return jsonify({"message": "Analytics not available for this router type"})
+    
+    # Error handlers
+    @app.errorhandler(404)
+    def not_found(error):
+        return jsonify({"error": "Endpoint not found"}), 404
+    
+    @app.errorhandler(500)
+    def internal_error(error):
+        return jsonify({"error": "Internal server error"}), 500
+    
+    return app
+
+# FastAPI version for production
+def create_production_fastapi_app():
+    """Production FastAPI app that integrates with your actual agent APIs"""
+    
+    from fastapi import FastAPI, HTTPException, BackgroundTasks
+    from fastapi.middleware.cors import CORSMiddleware
+    import asyncio
+    import aiohttp
+    import os
+    
+    app = FastAPI(
+        title="Multi-Agent Router API",
+        description="Routes queries to SQL Agent or Tools Agent APIs",
+        version="1.0.0"
+    )
+    
+    # Enable CORS
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],  # Configure appropriately for production
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    
+    # Configuration
+    api_config = APIConfig(
+        sql_agent_url=os.getenv("SQL_AGENT_URL", "http://localhost:8001/api/sql-query"),
+        tools_agent_url=os.getenv("TOOLS_AGENT_URL", "http://localhost:8002/api/tools-execute"),
+        timeout=int(os.getenv("API_TIMEOUT", "30")),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {os.getenv('API_TOKEN', '')}" if os.getenv('API_TOKEN') else {"Content-Type": "application/json"}
+        }
+    )
+    
+    llm_config = {
+        "provider": os.getenv("LLM_PROVIDER", "gemini").lower(),
+        "model": os.getenv("LLM_MODEL", "gemini-pro"),
+        "api_key": os.getenv("GOOGLE_API_KEY") or os.getenv("OPENAI_API_KEY") or os.getenv("ANTHROPIC_API_KEY"),
+        "temperature": 0,
+        "max_tokens": 10
+    }
+    
+    # Initialize router
+    try:
+        if llm_config["provider"] == "gemini":
+            router = GeminiOptimizedRouter(api_config, llm_config)
+        else:
+            router = EnhancedAPIAgentRouter(api_config, llm_config)
+        print(f"✅ Router initialized with {llm_config['provider']} LLM")
+    except Exception as e:
+        router = APIAgentRouter(api_config)
+        print(f"⚠️ LLM initialization failed, using rule-based routing: {e}")
+    
+    @app.get("/health")
+    async def health():
+        return {
+            "status": "healthy",
+            "router_type": type(router).__name__,
+            "llm_provider": llm_config.get("provider", "none"),
+            "agent_endpoints": {
+                "sql_agent": api_config.sql_agent_url,
+                "tools_agent": api_config.tools_agent_url
+            }
+        }
+    
+    @app.get("/test-agents")
+    async def test_agents():
+        """Async test of agent API connectivity"""
+        results = {}
+        
+        async with aiohttp.ClientSession() as session:
+            # Test SQL Agent
+            try:
+                test_payload = {"query": "SELECT 1 as test", "test_mode": True}
+                async with session.post(
+                    api_config.sql_agent_url,
+                    json=test_payload,
+                    headers=api_config.headers,
+                    timeout=aiohttp.ClientTimeout(total=5)
+                ) as response:
+                    results['sql_agent'] = {
+                        "status": "✅ Connected",
+                        "status_code": response.status,
+                        "url": api_config.sql_agent_url
+                    }
+            except Exception as e:
+                results['sql_agent'] = {
+                    "status": "❌ Failed",
+                    "error": str(e),
+                    "url": api_config.sql_agent_url
+                }
+            
+            # Test Tools Agent
+            try:
+                test_payload = {"query": "health check", "test_mode": True}
+                async with session.post(
+                    api_config.tools_agent_url,
+                    json=test_payload,
+                    headers=api_config.headers,
+                    timeout=aiohttp.ClientTimeout(total=5)
+                ) as response:
+                    results['tools_agent'] = {
+                        "status": "✅ Connected",
+                        "status_code": response.status,
+                        "url": api_config.tools_agent_url
+                    }
+            except Exception as e:
+                results['tools_agent'] = {
+                    "status": "❌ Failed",
+                    "error": str(e),
+                    "url": api_config.tools_agent_url
+                }
+        
+        return results
+    
+    @app.post("/chat")
+    async def chat(request: ChatRequest):
+        try:
+            if not request.message.strip():
+                raise HTTPException(status_code=400, detail="No message provided")
+            
+            # Route and call appropriate API
+            if hasattr(router, 'route_with_confidence'):
+                result = router.route_with_confidence(request.message, request.context)
+            else:
+                result = router.route_and_call(request.message, request.context)
+            
+            return result
+            
+        except requests.exceptions.RequestException as e:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Agent API request failed: {str(e)}"
+            )
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Unexpected error: {str(e)}"
+            )
+    
+    return app
+
+# Docker configuration for easy deployment
+def create_dockerfile():
+    """Generate Dockerfile for containerized deployment"""
+    
+    dockerfile_content = """
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application
+COPY . .
+
+# Environment variables (override in docker-compose or k8s)
+ENV SQL_AGENT_URL=http://sql-agent:8001/api/sql-query
+ENV TOOLS_AGENT_URL=http://tools-agent:8002/api/tools-execute
+ENV LLM_PROVIDER=gemini
+ENV LLM_MODEL=gemini-pro
+
+# Expose port
+EXPOSE 8000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+# Run the application
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+"""
+    
+    requirements_content = """
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+requests==2.31.0
+aiohttp==3.9.0
+google-generativeai==0.3.0
+openai==1.3.0
+anthropic==0.7.0
+python-multipart==0.0.6
+"""
+    
+    return dockerfile_content, requirements_content
+
+# Complete deployment example
+def deploy_production_setup():
+    """Complete production setup with all configurations"""
+    
+    print("🚀 PRODUCTION DEPLOYMENT SETUP")
+    print("=" * 50)
+    
+    # 1. Environment variables setup
+    env_template = """
+# API Configuration
+SQL_AGENT_URL=http://your-sql-agent:8001/api/sql-query
+TOOLS_AGENT_URL=http://your-tools-agent:8002/api/tools-execute
+API_TOKEN=your-api-token-if-needed
+API_TIMEOUT=30
+
+# LLM Configuration (choose one)
+LLM_PROVIDER=gemini
+LLM_MODEL=gemini-pro
+GOOGLE_API_KEY=your-google-api-key
+
+# Alternative LLM options:
+# LLM_PROVIDER=openai
+# OPENAI_API_KEY=your-openai-key
+# 
+# LLM_PROVIDER=anthropic  
+# ANTHROPIC_API_KEY=your-anthropic-key
+
+# Application Configuration
+PORT=8000
+DEBUG=false
+"""
+    
+    print("1. Create .env file with these variables:")
+    print(env_template)
+    
+    # 2. Docker setup
+    dockerfile, requirements = create_dockerfile()
+    print("\n2. Create Dockerfile:")
+    print(dockerfile[:200] + "...")
+    
+    # 3. Usage examples
+    print("\n3. Usage Examples:")
+    print("""
+# Test the router
+curl -X POST http://localhost:8000/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message": "Show me all users from the database"}'
+
+# Expected response:
+{
+  "success": true,
+  "agent_used": "sql_agent", 
+  "query": "Show me all users from the database",
+  "response": {
+    "status_code": 200,
+    "data": {...},
+    "api_endpoint": "http://your-sql-agent:8001/api/sql-query"
+  },
+  "confidence": 0.95,
+  "routing_method": "llm_high_confidence"
+}
+""")
+    
+    print("\n4. Health Check:")
+    print("curl http://localhost:8000/health")
+    
+    print("\n5. Test Agent Connectivity:")
+    print("curl http://localhost:8000/test-agents")
+    
+    print("\n✅ Setup complete! Your router will work with your exposed agent APIs.")
+
+if __name__ == "__main__":
+    # Run the deployment setup guide
+    deploy_production_setup()
+
+# FastAPI integration example
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+
+class ChatRequest(BaseModel):
+    message: str
+    context: Optional[Dict[str, Any]] = None
+
+def create_fastapi_app():
+    app = FastAPI(title="Multi-Agent Router API")
+    
+    config = APIConfig(
+        sql_agent_url="http://localhost:8001/sql-agent",
+        tools_agent_url="http://localhost:8002/tools-agent"
+    )
+    router = AsyncAPIAgentRouter(config)
+    
+    @app.post("/chat")
+    async def chat(request: ChatRequest):
+        try:
+            result = await router.route_and_call_async(request.message, request.context)
+            return result
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    @app.get("/health")
+    async def health():
+        return {
+            "status": "healthy",
+            "available_agents": ["sql_agent", "tools_agent"]
+        }
+    
+    return app
+
+# Usage examples with LLM-based routing
+if __name__ == "__main__":
+    # Configuration for your actual API endpoints
+    api_config = APIConfig(
+        sql_agent_url="http://localhost:8001/query",  # Replace with your actual endpoints
+        tools_agent_url="http://localhost:8002/execute",
+        timeout=30,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": "Bearer your-api-token"  # If needed
+        }
+    )
+    
+    # LLM configuration options
+    llm_configs = {
+        "openai": {
+            "provider": "openai",
+            "model": "gpt-4",  # or "gpt-3.5-turbo" for faster routing
+            "api_key": "your-openai-api-key",
+            "temperature": 0,
+            "max_tokens": 10
+        },
+        "anthropic": {
+            "provider": "anthropic", 
+            "model": "claude-3-sonnet-20240229",
+            "api_key": "your-anthropic-api-key",
+            "temperature": 0,
+            "max_tokens": 10
+        },
+        "local": {
+            "provider": "local",
+            "model": "llama2",  # or any local model
+            "base_url": "http://localhost:11434/v1",  # Ollama default
+            "temperature": 0,
+            "max_tokens": 10
+        }
+    }
+    
+    # Choose your LLM provider
+    router = APIAgentRouter(api_config, llm_configs["openai"])  # Change as needed
+    
+    # Test queries with LLM routing
+    test_queries = [
+        "Show me all users in the database",  # Should call SQL Agent API
+        "Get the server status for production",  # Should call Tools Agent API
+        "Count total orders for this month",  # Should call SQL Agent API
+        "Execute health check on my-instance",  # Should call Tools Agent API
+        "Find customers who purchased in the last 30 days",  # Should call SQL Agent API
+        "Deploy the latest version to staging environment",  # Should call Tools Agent API
+        "Generate a revenue report for Q4",  # Should call SQL Agent API
+        "Backup the database and upload to S3",  # Should call Tools Agent API
+        "What's the weather today?"  # Should return unknown response
+    ]
+    
+    print("Testing LLM-Based API Router...")
+    print("=" * 60)
+    
+    for query in test_queries:
+        print(f"\nQuery: {query}")
+        try:
+            result = router.route_and_call(query)
+            print(f"Success: {result['success']}")
+            print(f"Agent Used: {result.get('agent_used', 'N/A')}")
+            print(f"Routing Reason: {result.get('routing_reason', 'N/A')}")
+            
+            if result['success']:
+                api_response = result['response']
+                print(f"API Status: {api_response.get('status_code', 'N/A')}")
+                print(f"API Endpoint: {api_response.get('api_endpoint', 'N/A')}")
+            else:
+                print(f"Error: {result.get('error', 'Unknown error')}")
+                
+        except Exception as e:
+            print(f"Exception: {str(e)}")
+        
+        print("-" * 40)
+
+# Enhanced Flask app with LLM routing
+def create_enhanced_flask_app():
+    app = Flask(__name__)
+    
+    # LLM configuration
+    llm_config = {
+        "provider": "openai",
+        "model": "gpt-4",
+        "api_key": "your-openai-api-key",  # Set your actual API key
+        "temperature": 0
+    }
+    
+    # Initialize router with LLM support
+    config = APIConfig(
+        sql_agent_url="http://localhost:8001/sql-agent",
+        tools_agent_url="http://localhost:8002/tools-agent",
+        timeout=30,
+        headers={"Content-Type": "application/json"}
+    )
+    router = APIAgentRouter(config, llm_config)
+    
+    @app.route('/chat', methods=['POST'])
+    def chat():
+        try:
+            data = request.json
+            user_input = data.get('message', '').strip()
+            user_context = data.get('context', {})
+            use_llm_routing = data.get('use_llm', True)  # Allow disabling LLM routing
+            
+            if not user_input:
+                return jsonify({"error": "No message provided"}), 400
+            
+            # Route with LLM or fallback to rules
+            if use_llm_routing:
+                result = router.route_and_call(user_input, user_context)
+            else:
+                # Force rule-based routing
+                old_determine = router._determine_agent
+                router._determine_agent = lambda x: router._rule_based_routing(x)
+                result = router.route_and_call(user_input, user_context)
+                router._determine_agent = old_determine
+            
+            return jsonify(result)
+            
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route('/test-routing', methods=['POST'])
+    def test_routing():
+        """Test different routing approaches"""
+        try:
+            data = request.json
+            query = data.get('query', '')
+            
+            if not query:
+                return jsonify({"error": "No query provided"}), 400
+            
+            results = {}
+            
+            # Test LLM routing
+            try:
+                llm_result = router._llm_based_routing(query)
+                results['llm_routing'] = llm_result.value
+            except Exception as e:
+                results['llm_routing'] = f"Error: {str(e)}"
+            
+            # Test rule-based routing
+            try:
+                rule_result = router._rule_based_routing(query)
+                results['rule_routing'] = rule_result.value
+            except Exception as e:
+                results['rule_routing'] = f"Error: {str(e)}"
+            
+            # Test different prompt styles
+            for style in ['simple', 'detailed', 'few_shot']:
+                try:
+                    prompt = router._get_routing_prompt(query, style)
+                    results[f'{style}_prompt'] = prompt[:200] + "..." if len(prompt) > 200 else prompt
+                except Exception as e:
+                    results[f'{style}_prompt'] = f"Error: {str(e)}"
+            
+            return jsonify({
+                "query": query,
+                "routing_results": results
+            })
+            
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    
+    return app
+
+# Helper function for testing individual APIs
+def test_api_connectivity(config: APIConfig):
+    """Test if both APIs are reachable"""
+    
+    test_payload = {"query": "test connectivity", "test": True}
+    
+    print("Testing API Connectivity...")
+    
+    # Test SQL Agent API
+    try:
+        response = requests.post(
+            config.sql_agent_url,
+            json=test_payload,
+            headers=config.headers,
+            timeout=5
+        )
+        print(f"✅ SQL Agent API ({config.sql_agent_url}): Status {response.status_code}")
+    except Exception as e:
+        print(f"❌ SQL Agent API ({config.sql_agent_url}): {str(e)}")
+    
+    # Test Tools Agent API  
+    try:
+        response = requests.post(
+            config.tools_agent_url,
+            json=test_payload,
+            headers=config.headers,
+            timeout=5
+        )
+        print(f"✅ Tools Agent API ({config.tools_agent_url}): Status {response.status_code}")
+    except Exception as e:
+        print(f"❌ Tools Agent API ({config.tools_agent_url}): {str(e)}")
+
+
+
+
 *****†"*********
 # Anti-Hallucination and Forced Tool Execution System
 from typing import Dict, List, Any, Optional
