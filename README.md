@@ -1,3 +1,726 @@
+zzzzzzzz
+
+# LLM-BASED INSTANCE NAME EXTRACTION AND AUTO-PASSING SYSTEM
+
+import json
+import logging
+from typing import Dict, Optional, Tuple, List
+from langchain.tools import tool
+from langchain.chat_models import ChatOpenAI
+from langchain.prompts import ChatPromptTemplate
+from langchain.schema import BaseMessage
+import re
+
+# Configuration
+valid_instances = {"DA3", "DB3", "DC3", "DG3", "LS3"}
+session_context = {"instance_name": None, "job_name": None, "calendar_name": None}
+
+class LLMInstanceExtractor:
+    """Uses LLM to intelligently extract instance names from user messages"""
+    
+    def __init__(self, llm_config: Dict = None):
+        self.llm_config = llm_config or {
+            "provider": "openai",
+            "model": "gpt-3.5-turbo",  # Fast and cheap for extraction
+            "temperature": 0,
+            "api_key": "your-api-key"
+        }
+        self.llm = self._initialize_llm()
+        
+        # Extraction prompt template
+        self.extraction_prompt = ChatPromptTemplate.from_messages([
+            ("system", self._get_extraction_system_prompt()),
+            ("user", "{user_input}")
+        ])
+    
+    def _initialize_llm(self):
+        """Initialize LLM for instance extraction"""
+        if self.llm_config["provider"] == "openai":
+            return ChatOpenAI(
+                model=self.llm_config["model"],
+                temperature=self.llm_config["temperature"],
+                api_key=self.llm_config["api_key"],
+                max_tokens=50  # Short responses
+            )
+        # Add other providers as needed
+        return None
+    
+    def _get_extraction_system_prompt(self) -> str:
+        """System prompt for instance extraction"""
+        return f"""You are an AutoSys instance name extractor. Your job is to find AutoSys instance names in user messages.
+
+VALID INSTANCES: {', '.join(valid_instances)}
+
+EXTRACTION RULES:
+1. Look for exact matches: DA3, DB3, DC3, DG3, LS3
+2. Look for patterns like: "use DA3", "connect to DB3", "on DC3", "from DG3"
+3. Check for database/AutoSys context: "AutoSys instance DA3", "database DB3"
+4. Consider SQL queries: "DA3 SELECT * FROM jobs"
+
+RESPONSE FORMAT:
+- If instance found: Return ONLY the instance name (e.g., "DA3")
+- If no instance found: Return "NONE"
+- If multiple instances found: Return the first/most relevant one
+
+EXAMPLES:
+User: "What jobs are running on DA3?" → DA3
+User: "Show me DB3 database tables" → DB3  
+User: "use DC3 and run this query" → DC3
+User: "SELECT * FROM jobs" → NONE
+User: "What is the weather?" → NONE
+
+Extract instance name from the user input:"""
+    
+    def extract_instance(self, user_input: str) -> Optional[str]:
+        """Extract instance name using LLM"""
+        try:
+            # First try simple pattern matching (faster)
+            pattern_result = self._pattern_extraction(user_input)
+            if pattern_result:
+                logging.info(f"Pattern extraction found: {pattern_result}")
+                return pattern_result
+            
+            # Fall back to LLM extraction for complex cases
+            if self.llm:
+                response = self.llm.predict(
+                    self.extraction_prompt.format_messages(user_input=user_input)[0].content
+                )
+                
+                extracted = response.strip().upper()
+                logging.info(f"LLM extraction result: '{extracted}'")
+                
+                if extracted in valid_instances:
+                    return extracted
+                elif extracted == "NONE":
+                    return None
+                else:
+                    # LLM returned invalid instance, try pattern matching
+                    return self._pattern_extraction(user_input)
+            
+            return None
+            
+        except Exception as e:
+            logging.error(f"Instance extraction error: {e}")
+            return self._pattern_extraction(user_input)  # Fallback
+    
+    def _pattern_extraction(self, user_input: str) -> Optional[str]:
+        """Fallback pattern-based extraction"""
+        user_upper = user_input.upper()
+        
+        # Direct instance match
+        for instance in valid_instances:
+            if instance in user_upper:
+                return instance
+        
+        return None
+
+class SmartInstanceHandler:
+    """Handles automatic instance passing with LLM intelligence"""
+    
+    def __init__(self, llm_config: Dict = None):
+        self.extractor = LLMInstanceExtractor(llm_config)
+        
+    def process_user_input(self, user_input: str) -> Tuple[str, Optional[str], str]:
+        """
+        Process user input and determine instance handling strategy
+        
+        Returns:
+            (processed_query, extracted_instance, strategy)
+        """
+        
+        # Extract instance name using LLM
+        extracted_instance = self.extractor.extract_instance(user_input)
+        
+        if extracted_instance:
+            # Instance found in input
+            session_context["instance_name"] = extracted_instance
+            
+            # Clean the query (remove instance references for cleaner SQL)
+            cleaned_query = self._clean_query(user_input, extracted_instance)
+            
+            return cleaned_query, extracted_instance, "extracted_and_set"
+        
+        else:
+            # No instance in input - check if query requires instance
+            requires_instance = self._requires_instance_context(user_input)
+            
+            if requires_instance:
+                # Query needs instance but none provided - ask for it
+                current_instance = session_context.get("instance_name")
+                
+                if current_instance:
+                    # We have session context, ask if user wants to use it
+                    return user_input, current_instance, "confirm_session_usage"
+                else:
+                    # No context at all, must ask for instance
+                    return user_input, None, "must_ask_for_instance"
+            else:
+                # Query doesn't require specific instance (general questions)
+                current_instance = session_context.get("instance_name")
+                if current_instance:
+                    return user_input, current_instance, "using_session"
+                else:
+                    return user_input, None, "general_query"
+    
+    def _requires_instance_context(self, user_input: str) -> bool:
+        """
+        Determine if query requires specific instance context
+        Returns True for queries that need instance specification
+        """
+        
+        user_upper = user_input.upper()
+        
+        # Patterns that REQUIRE instance context
+        instance_required_patterns = [
+            # Job-specific queries
+            r'(?:status|state)\s+of\s+job\s*\w+',  # "status of job123"
+            r'job\s+(?:status|state|info|details)',  # "job status", "job info" 
+            r'(?:what|show|get|find)\s+.*job\s*\w+',  # "what is job123", "show job456"
+            r'job\s*\w+\s+(?:status|state|running|failed)',  # "job123 status"
+            
+            # Database/table queries that need specific instance
+            r'(?:select|show|describe|update|insert|delete)',  # SQL queries
+            r'(?:table|database|schema)\s+(?:info|details|status)',
+            r'(?:count|sum|total)\s+.*(?:from|in)',
+            
+            # System-specific queries
+            r'(?:server|instance|system)\s+(?:status|info|health)',
+            r'(?:running|failed|success)\s+(?:jobs|tasks)',
+            r'(?:queue|schedule|calendar)\s+',
+            
+            # Performance/monitoring queries
+            r'(?:performance|metrics|stats|statistics)',
+            r'(?:load|cpu|memory|disk)\s+',
+            r'(?:alert|error|warning|log)',
+            
+            # Time-based queries that need specific instance
+            r'(?:today|yesterday|last\s+\w+)\s+.*(?:jobs|tasks|runs)',
+            r'(?:daily|weekly|monthly)\s+(?:report|summary)',
+        ]
+        
+        for pattern in instance_required_patterns:
+            if re.search(pattern, user_upper):
+                logging.info(f"Instance required - matched pattern: {pattern}")
+                return True
+        
+        # Additional logic: if it contains job names/IDs, likely needs instance
+        if re.search(r'\bjob\s*\w+\b', user_upper):
+            logging.info("Instance required - contains job reference")
+            return True
+        
+        # If it's a SQL query, it needs instance
+        sql_keywords = ['SELECT', 'SHOW', 'DESCRIBE', 'UPDATE', 'INSERT', 'DELETE', 'CREATE', 'DROP']
+        if any(keyword in user_upper for keyword in sql_keywords):
+            logging.info("Instance required - contains SQL keywords")
+            return True
+        
+        return False
+    
+    def _clean_query(self, query: str, instance: str) -> str:
+        """Clean query by removing instance references"""
+        
+        # Remove common instance patterns
+        patterns = [
+            rf'\b{instance}\s+',  # "DA3 SELECT" → "SELECT"
+            rf'(?:use|on|from)\s+{instance}\s*',  # "use DA3" → ""
+            rf'(?:connect\s+to|instance)\s+{instance}\s*',  # "connect to DA3" → ""
+        ]
+        
+        cleaned = query
+        for pattern in patterns:
+            cleaned = re.sub(pattern, '', cleaned, flags=re.IGNORECASE)
+        
+        return cleaned.strip()
+
+# ENHANCED SQL TOOL WITH SMART INSTANCE REQUIREMENT DETECTION
+@tool
+def smart_sql_database_query(user_input: str) -> str:
+    """
+    Smart AutoSys database tool with intelligent instance handling.
+    
+    Behavior:
+    - If instance mentioned in query → Auto-extract and use it
+    - If query requires instance but none provided → Ask for instance
+    - If query doesn't require instance → Answer generally or use session
+    - Maintains conversation context for follow-up queries
+    
+    Args:
+        user_input: User's natural language input
+        
+    Returns:
+        Query results or appropriate response
+    """
+    
+    logging.info(f"🤖 Smart SQL tool called with: '{user_input}'")
+    
+    try:
+        # Initialize smart handler
+        handler = SmartInstanceHandler({
+            "provider": "openai",
+            "model": "gpt-3.5-turbo", 
+            "temperature": 0,
+            "api_key": "your-openai-api-key"  # Set your API key
+        })
+        
+        # Process input with intelligent instance handling
+        processed_query, instance, strategy = handler.process_user_input(user_input)
+        
+        logging.info(f"🧠 Processing strategy: {strategy}")
+        logging.info(f"📍 Instance: {instance}")
+        logging.info(f"🔍 Processed query: '{processed_query}'")
+        
+        if strategy == "extracted_and_set":
+            # Instance was extracted from user input
+            if is_sql_query(processed_query):
+                result = execute_sql_query(processed_query, instance)
+                return f"✅ Executed on {instance}:\n{result}"
+            else:
+                result = execute_sql_query(user_input, instance)
+                return f"✅ Query result from {instance}:\n{result}"
+        
+        elif strategy == "using_session":
+            # Using instance from session context
+            if is_sql_query(user_input):
+                result = execute_sql_query(user_input, instance) 
+                return f"✅ Executed on {instance}:\n{result}"
+            else:
+                result = execute_sql_query(user_input, instance)
+                return f"✅ Query result from {instance}:\n{result}"
+        
+        elif strategy == "confirm_session_usage":
+            # Query needs instance, we have session context, confirm usage
+            return f"❓ Do you want to check this on the current instance ({instance})?\n\nYour query: '{user_input}'\n\nOr specify a different instance: {', '.join(valid_instances)}"
+        
+        elif strategy == "must_ask_for_instance":
+            # Query requires instance but none provided or in session
+            return f"❗ This query requires an AutoSys instance to be specified.\n\n💡 Your query: '{user_input}'\n\n📋 Please specify the instance:\n• Available: {', '.join(valid_instances)}\n• Example: 'Check job status of job123 on DA3'\n• Example: 'DA3 {user_input}'"
+        
+        elif strategy == "general_query":
+            # General question that doesn't require specific instance
+            if any(phrase in user_input.lower() for phrase in ['what is', 'how to', 'explain', 'help', 'what are']):
+                return handle_general_question(user_input)
+            else:
+                # Might still need instance, provide helpful guidance
+                return f"💡 For specific queries, please include the instance name.\n\n📋 Available instances: {', '.join(valid_instances)}\n\nExamples:\n• 'Show jobs on DA3'\n• 'DA3 job status'\n• 'Check DB3 performance'"
+        
+        else:
+            return "❌ Unable to process request - unknown strategy"
+    
+    except Exception as e:
+        logging.error(f"Smart SQL tool error: {e}")
+        return f"❌ Error processing request: {str(e)}"
+
+def handle_general_question(user_input: str) -> str:
+    """Handle general questions that don't require specific instances"""
+    
+    user_lower = user_input.lower()
+    
+    if "instance" in user_lower and ("what" in user_lower or "which" in user_lower):
+        current = session_context.get("instance_name")
+        if current:
+            return f"📍 Current AutoSys instance: {current}\n\n📋 All available instances: {', '.join(valid_instances)}"
+        else:
+            return f"❓ No current instance set.\n\n📋 Available AutoSys instances: {', '.join(valid_instances)}\n\n💡 Set an instance by including it in your query: 'Show jobs on DA3'"
+    
+    elif "job" in user_lower and ("what" in user_lower or "how" in user_lower):
+        return """📚 AutoSys Job Information:
+
+AutoSys jobs are scheduled tasks that run on different instances. To check job information:
+
+🔍 Job Status Queries:
+• "What is the status of job123 on DA3?"
+• "Show job456 details from DB3"
+• "DA3 job789 status"
+
+📊 Job Queries Examples:
+• "Show all running jobs on DC3"
+• "Find failed jobs on DG3"
+• "LS3 job schedule for today"
+
+💡 Always specify the instance (DA3, DB3, DC3, DG3, LS3) for specific job queries."""
+    
+    else:
+        return f"❓ I can help with AutoSys queries!\n\n💡 For specific information, please include:\n• Instance name: {', '.join(valid_instances)}\n• What you want to know\n\nExample: 'What is the status of job123 on DA3?'"
+
+def is_sql_query(query: str) -> bool:
+    """Check if input contains SQL keywords"""
+    sql_keywords = ['SELECT', 'SHOW', 'DESCRIBE', 'UPDATE', 'INSERT', 'DELETE', 'CREATE', 'DROP']
+    query_upper = query.upper()
+    return any(keyword in query_upper for keyword in sql_keywords)
+
+def execute_sql_query(query: str, instance: str) -> str:
+    """Execute SQL query on specified instance"""
+    try:
+        logging.info(f"Executing on {instance}: {query}")
+        
+        # Your actual SQL execution logic here
+        # This is a mock response for demonstration
+        return f"""Query: {query}
+Instance: {instance}
+Status: ✅ Success
+
+[Results would appear here from {instance} database]
+Rows affected: 42
+Execution time: 0.15s"""
+        
+    except Exception as e:
+        return f"❌ SQL execution failed: {str(e)}"
+
+# LLM-POWERED CONVERSATION ANALYZER
+class ConversationContextAnalyzer:
+    """Analyzes conversation context to make better instance decisions"""
+    
+    def __init__(self, llm_config: Dict):
+        self.llm = ChatOpenAI(**llm_config)
+        self.conversation_history = []
+    
+    def analyze_context(self, user_input: str, history: List[str] = None) -> Dict:
+        """Analyze conversation context for better instance handling"""
+        
+        context_prompt = f"""
+        Analyze this AutoSys conversation for instance context:
+        
+        Recent conversation:
+        {chr(10).join(history[-3:]) if history else "No previous context"}
+        
+        Current user input: "{user_input}"
+        
+        Valid instances: {', '.join(valid_instances)}
+        
+        Provide analysis as JSON:
+        {{
+            "instance_mentioned": "DA3|DB3|DC3|DG3|LS3|null",
+            "confidence": "high|medium|low", 
+            "context_clues": ["list", "of", "clues"],
+            "recommended_action": "set_instance|use_session|ask_user"
+        }}
+        """
+        
+        try:
+            response = self.llm.predict(context_prompt)
+            return json.loads(response)
+        except Exception as e:
+            logging.error(f"Context analysis error: {e}")
+            return {
+                "instance_mentioned": None,
+                "confidence": "low",
+                "context_clues": [],
+                "recommended_action": "ask_user"
+            }
+
+# ADVANCED AGENT WITH CONVERSATION AWARENESS
+class ConversationAwareAgent:
+    """Agent that maintains conversation context for better instance handling"""
+    
+    def __init__(self, llm_config: Dict = None):
+        self.handler = SmartInstanceHandler(llm_config)
+        self.analyzer = ConversationContextAnalyzer(llm_config or {
+            "model": "gpt-3.5-turbo",
+            "temperature": 0,
+            "api_key": "your-openai-api-key"
+        })
+        self.conversation_history = []
+    
+    def run(self, user_input: str) -> str:
+        """Process with full conversation awareness"""
+        
+        # Add to conversation history
+        self.conversation_history.append(f"User: {user_input}")
+        
+        # Analyze context
+        context = self.analyzer.analyze_context(user_input, self.conversation_history)
+        
+        # Process with enhanced context
+        if context.get("instance_mentioned") and context.get("confidence") == "high":
+            # High confidence instance detection
+            instance = context["instance_mentioned"]
+            session_context["instance_name"] = instance
+            
+            result = smart_sql_database_query(user_input)
+        else:
+            # Standard processing
+            result = smart_sql_database_query(user_input)
+        
+        # Add result to history
+        self.conversation_history.append(f"Assistant: {result}")
+        
+        # Keep history manageable
+        if len(self.conversation_history) > 10:
+            self.conversation_history = self.conversation_history[-8:]
+        
+        return result
+
+# TESTING AND EXAMPLES
+def test_llm_instance_extraction():
+    """Test LLM-based instance extraction"""
+    
+    print("🧪 TESTING LLM INSTANCE EXTRACTION")
+    print("=" * 50)
+    
+    extractor = LLMInstanceExtractor({
+        "provider": "openai",
+        "model": "gpt-3.5-turbo",
+        "temperature": 0,
+        "api_key": "your-openai-api-key"  # Set your key
+    })
+    
+    test_cases = [
+        "What jobs are running on DA3?",
+        "Show me the DB3 database schema", 
+        "DA3 SELECT * FROM jobs WHERE status='RUNNING'",
+        "Use DC3 and show me all tables",
+        "Connect to DG3 instance",
+        "SELECT count(*) FROM jobs",  # No instance
+        "What's the weather today?",   # No instance
+        "LS3 database backup status"
+    ]
+    
+    for test_input in test_cases:
+        extracted = extractor.extract_instance(test_input)
+        print(f"Input: '{test_input}'")
+        print(f"Extracted: {extracted or 'None'}")
+        print("-" * 30)
+
+def demo_smart_agent():
+    """Demonstrate the smart agent in action"""
+    
+    print("🚀 SMART AGENT DEMONSTRATION")
+    print("=" * 50)
+    
+    agent = ConversationAwareAgent()
+    
+    demo_conversation = [
+        "What jobs are running on DA3?",
+        "Show me failed jobs too",
+        "Now check DB3 status", 
+        "SELECT count(*) FROM jobs",
+        "What about DC3 performance?"
+    ]
+    
+    for message in demo_conversation:
+        print(f"\nUser: {message}")
+        response = agent.run(message)
+        print(f"Agent: {response}")
+        print(f"Session: {session_context.get('instance_name', 'None')}")
+
+# PRODUCTION INTEGRATION
+def create_llm_powered_sql_agent(llm_config: Dict = None):
+    """Create production-ready LLM-powered SQL agent"""
+    
+    return ConversationAwareAgent(llm_config or {
+        "provider": "openai",
+        "model": "gpt-3.5-turbo",  # Fast and cost-effective
+        "temperature": 0,
+        "api_key": "your-openai-api-key"
+    })
+
+# COMPREHENSIVE TESTING FOR CONDITIONAL INSTANCE HANDLING
+def test_conditional_instance_handling():
+    """Test the conditional instance handling logic"""
+    
+    print("🧪 TESTING CONDITIONAL INSTANCE HANDLING")
+    print("=" * 60)
+    
+    # Reset session for clean testing
+    session_context["instance_name"] = None
+    
+    test_scenarios = [
+        # Scenario 1: Instance provided in query
+        {
+            "input": "What is the status of job123 in DA3?",
+            "expected_strategy": "extracted_and_set",
+            "expected_instance": "DA3",
+            "description": "Instance explicitly provided"
+        },
+        
+        # Scenario 2: Job query without instance (should ask)
+        {
+            "input": "What is the status of job123?",
+            "expected_strategy": "must_ask_for_instance", 
+            "expected_instance": None,
+            "description": "Job query without instance - should ask"
+        },
+        
+        # Scenario 3: General question (doesn't need instance)
+        {
+            "input": "What is AutoSys?",
+            "expected_strategy": "general_query",
+            "expected_instance": None, 
+            "description": "General question - no instance needed"
+        },
+        
+        # Scenario 4: SQL query without instance (should ask)
+        {
+            "input": "SELECT * FROM jobs WHERE status='RUNNING'",
+            "expected_strategy": "must_ask_for_instance",
+            "expected_instance": None,
+            "description": "SQL query without instance - should ask"
+        },
+        
+        # Scenario 5: After setting instance, use for follow-up
+        {
+            "setup": lambda: session_context.update({"instance_name": "DB3"}),
+            "input": "Show me failed jobs",
+            "expected_strategy": "using_session",
+            "expected_instance": "DB3", 
+            "description": "Follow-up query using session instance"
+        },
+        
+        # Scenario 6: Job query with session context (confirm usage)
+        {
+            "setup": lambda: session_context.update({"instance_name": "DC3"}),
+            "input": "What is job456 status?",
+            "expected_strategy": "confirm_session_usage",
+            "expected_instance": "DC3",
+            "description": "Job query with session context - should confirm"
+        }
+    ]
+    
+    handler = SmartInstanceHandler()
+    
+    for i, scenario in enumerate(test_scenarios, 1):
+        print(f"\n{i}. {scenario['description']}")
+        print(f"   Input: '{scenario['input']}'")
+        
+        # Setup if needed
+        if 'setup' in scenario:
+            scenario['setup']()
+            print(f"   Setup: Session instance = {session_context.get('instance_name')}")
+        
+        # Process input
+        processed_query, instance, strategy = handler.process_user_input(scenario['input'])
+        
+        print(f"   Strategy: {strategy}")
+        print(f"   Instance: {instance}")
+        print(f"   Expected Strategy: {scenario['expected_strategy']}")
+        print(f"   Expected Instance: {scenario['expected_instance']}")
+        
+        # Check results
+        strategy_match = strategy == scenario['expected_strategy']
+        instance_match = instance == scenario['expected_instance']
+        
+        if strategy_match and instance_match:
+            print("   ✅ PASS")
+        else:
+            print("   ❌ FAIL")
+            if not strategy_match:
+                print(f"      Strategy mismatch: got {strategy}, expected {scenario['expected_strategy']}")
+            if not instance_match:
+                print(f"      Instance mismatch: got {instance}, expected {scenario['expected_instance']}")
+        
+        print("-" * 40)
+        
+        # Reset for next test
+        session_context["instance_name"] = None
+
+def test_complete_conversation_flow():
+    """Test complete conversation flow with mixed scenarios"""
+    
+    print("\n🎭 TESTING COMPLETE CONVERSATION FLOW")
+    print("=" * 60)
+    
+    # Reset session
+    session_context["instance_name"] = None
+    
+    conversation = [
+        ("What is the status of job123?", "Should ask for instance"),
+        ("What is the status of job123 in DA3?", "Should extract DA3 and show status"),
+        ("Show me failed jobs", "Should use DA3 from session"),
+        ("What about job456 status?", "Should confirm DA3 usage or ask"),
+        ("Check DB3 performance", "Should switch to DB3"),
+        ("SELECT count(*) FROM jobs", "Should use DB3"),
+        ("What is AutoSys?", "Should answer generally without needing instance")
+    ]
+    
+    for i, (user_input, expected_behavior) in enumerate(conversation, 1):
+        print(f"\n{i}. User: '{user_input}'")
+        print(f"   Expected: {expected_behavior}")
+        
+        try:
+            response = smart_sql_database_query(user_input)
+            print(f"   Response: {response[:100]}...")
+            print(f"   Session: {session_context.get('instance_name', 'None')}")
+        except Exception as e:
+            print(f"   Error: {e}")
+        
+        print("-" * 50)
+
+def demonstrate_smart_behavior():
+    """Demonstrate the smart conditional behavior"""
+    
+    print("\n🎯 SMART BEHAVIOR DEMONSTRATION")
+    print("=" * 60)
+    
+    examples = {
+        "✅ Auto-Extract Instance": [
+            "What is the status of job123 in DA3?",
+            "Show DB3 job performance", 
+            "DC3 SELECT * FROM jobs"
+        ],
+        
+        "❗ Ask for Instance (Job Queries)": [
+            "What is the status of job123?",
+            "Show me job456 details",
+            "Check job789 performance"
+        ],
+        
+        "❗ Ask for Instance (SQL Queries)": [
+            "SELECT * FROM jobs WHERE status='RUNNING'",
+            "SHOW TABLES",
+            "UPDATE jobs SET status='HOLD'"
+        ],
+        
+        "💡 General Responses (No Instance Needed)": [
+            "What is AutoSys?",
+            "How do jobs work?", 
+            "What instances are available?"
+        ],
+        
+        "🔄 Use Session Context": [
+            # After DA3 is set:
+            "Show me all jobs",
+            "What about performance?",
+            "Run daily report"
+        ]
+    }
+    
+    for category, queries in examples.items():
+        print(f"\n{category}:")
+        for query in queries:
+            print(f"  • '{query}'")
+    
+    print(f"\n📋 Available instances: {', '.join(valid_instances)}")
+
+if __name__ == "__main__":
+    # Run comprehensive tests
+    test_conditional_instance_handling()
+    test_complete_conversation_flow() 
+    demonstrate_smart_behavior()
+    
+    print("\n" + "=" * 60)
+    print("🎯 CONDITIONAL INSTANCE HANDLING READY")
+    print("=" * 60)
+    
+    print("""
+✅ Smart Behavior Implemented:
+
+📍 WITH INSTANCE: Auto-extracts and uses
+   • "What is job123 status in DA3?" → Uses DA3
+   
+❓ WITHOUT INSTANCE (Job/SQL queries): Asks for instance  
+   • "What is job123 status?" → "Please specify instance"
+   
+💡 GENERAL QUESTIONS: Answers without needing instance
+   • "What is AutoSys?" → General explanation
+   
+🔄 SESSION CONTEXT: Remembers for follow-up queries
+   • After DA3 set: "Show jobs" → Uses DA3
+   
+⚡ The system is now intelligent about when to ask vs when to proceed!
+    """)
+
+zzzzzzzzz
+
 vvvvbbbbbbbbbbb
 # COMPLETE SOLUTION TO FORCE TOOL EXECUTION
 
