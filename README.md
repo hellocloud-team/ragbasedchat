@@ -1,3 +1,376 @@
+
+xxxxxxxxxxxxxxxx
+
+import yaml
+import pandas as pd
+import logging
+from langchain_community.utilities import SQLDatabase
+from langchain_community.tools.sql_database.tool import QuerySQLDataBaseTool
+from langchain.agents import initialize_agent, AgentType
+from langchain_community.utilities import SQLDatabase
+
+# Load config.yaml
+# with open("config.yaml", "r") as f:
+#     config = yaml.safe_load(f)
+
+# Define valid instance names
+valid_instance = {"DA3", "DB3", "DC3", "DG3", "LS3"}
+
+# Global session context to store instance name
+session_context = {
+    "instance_name": None,
+    "job_name": None,
+    "calendar_name": None
+}
+
+def maybe_store_instance_name(message: str):
+    """Extract and store instance name from message"""
+    normalized = message.strip().upper()
+    logging.info(f"Trying to store instance name: {normalized}")
+    
+    # Check if the normalized message is a valid instance name
+    if normalized in valid_instance:
+        session_context["instance_name"] = normalized
+        logging.info(f"Instance name set to: {normalized}")
+        return f"✅ Instance name set to {normalized}."
+    
+    # Check if message contains instance name patterns
+    import re
+    
+    # Pattern 1: "instance: NAME" or "instance NAME"
+    instance_patterns = [
+        r'instance[:\s]+([A-Z0-9]+)',
+        r'using\s+([A-Z0-9]+)',
+        r'connect\s+to\s+([A-Z0-9]+)',
+        r'database\s+([A-Z0-9]+)'
+    ]
+    
+    for pattern in instance_patterns:
+        match = re.search(pattern, normalized)
+        if match:
+            potential_instance = match.group(1)
+            if potential_instance in valid_instance:
+                session_context["instance_name"] = potential_instance
+                logging.info(f"Instance name extracted and set to: {potential_instance}")
+                return f"✅ Instance name set to {potential_instance}."
+    
+    # Check if any valid instance name appears in the message
+    for instance in valid_instance:
+        if instance in normalized:
+            session_context["instance_name"] = instance
+            logging.info(f"Instance name found and set to: {instance}")
+            return f"✅ Instance name set to {instance}."
+    
+    return None
+
+def get_oracle_uri(instance_name: str) -> str:
+    """Get Oracle URI for given instance"""
+    # Replace with your actual config logic
+    # oracle_uri = config["db"].get(instance_name)
+    # For now, return a mock URI
+    oracle_uri = f"oracle://user:pass@host:port/{instance_name}"
+    return oracle_uri
+
+def connect_to_sql_database(instance_name: str) -> SQLDatabase:
+    """Connect to SQL database using instance name"""
+    oracle_uri = get_oracle_uri(instance_name)
+    return SQLDatabase.from_uri(oracle_uri)
+
+def handle_message(message: str):
+    """Handle incoming message and potentially store instance name"""
+    instance_response = maybe_store_instance_name(message)
+    if instance_response:
+        return instance_response
+    
+    # If it's a SQL query but instance is missing, prompt again
+    if "SELECT" in message.upper() and not session_context.get("instance_name"):
+        return "❗ Please provide the AutoSys instance name before running this query."
+    
+    return sql_query(message)
+
+def sql_query(query: str, instance_name: str = None) -> str:
+    """
+    Execute SQL query on specified database instance.
+    
+    Args:
+        query: SQL query to execute
+        instance_name: Database instance name (DA3, DB3, DC3, DG3, LS3)
+    
+    Returns:
+        Query results as formatted string
+    """
+    
+    # FIXED: Use provided instance_name parameter first, then session context
+    if instance_name:
+        current_instance = instance_name
+        # Update session context with provided instance
+        session_context["instance_name"] = instance_name
+        logging.info(f"Using provided instance name: {instance_name}")
+    else:
+        current_instance = session_context.get("instance_name")
+        logging.info(f"Using session instance name: {current_instance}")
+    
+    # Check if instance name is available
+    if not current_instance:
+        logging.warning("Instance name missing in session_context.")
+        return "❗ Please provide the AutoSys instance name before running this query."
+
+    try:
+        # Connect to database
+        db = connect_to_sql_database(current_instance)
+        
+        # Clean and format query
+        formatted_query = query.replace("\\n", "\n").replace("\\'", "'")
+        
+        # Execute query
+        result = db.run(formatted_query)
+        
+        # Convert result to DataFrame for better formatting
+        if isinstance(result, str):
+            # Handle string results (like from DESCRIBE, SHOW commands)
+            if result.strip():
+                lines = result.strip().split('\n')
+                if len(lines) > 1:
+                    # Assume first line is headers
+                    headers = [col.strip() for col in lines[0].split('|') if col.strip()]
+                    data = []
+                    for line in lines[1:]:
+                        row_data = [col.strip() for col in line.split('|') if col.strip()]
+                        if row_data:  # Skip empty rows
+                            data.append(row_data)
+                    
+                    if data and headers:
+                        df = pd.DataFrame(data, columns=headers)
+                        return df.to_string(index=False)
+            
+            return result
+            
+        elif isinstance(result, list):
+            # Handle list results (multiple rows)
+            if result:
+                if all(isinstance(row, dict) for row in result):
+                    # List of dictionaries
+                    df = pd.DataFrame(result)
+                    return df.to_string(index=False)
+                else:
+                    # List of tuples/lists
+                    df = pd.DataFrame(result)
+                    return df.to_string(index=False)
+            else:
+                return "No results found."
+        
+        else:
+            # Handle other result types
+            return f"Query executed successfully. Result: {str(result)}"
+
+    except ValueError as ve:
+        logging.error(f"Value error: {str(ve)}")
+        return f"❌ Data processing error: {str(ve)}"
+    except Exception as e:
+        logging.error(f"Error executing SQL query: {str(e)}")
+        return f"❌ Error executing query: {str(e)}"
+
+# FIXED: Enhanced message handler with better instance detection
+def enhanced_handle_message(message: str):
+    """Enhanced message handler with improved instance name detection"""
+    
+    message_upper = message.upper().strip()
+    
+    # Method 1: Direct instance name check
+    if message_upper in valid_instance:
+        session_context["instance_name"] = message_upper
+        return f"✅ Instance name set to {message_upper}. You can now run SQL queries."
+    
+    # Method 2: Check for instance in the query itself
+    for instance in valid_instance:
+        if instance in message_upper:
+            session_context["instance_name"] = instance
+            logging.info(f"Found instance {instance} in message")
+            
+            # If it's also a SQL query, execute it immediately
+            if any(keyword in message_upper for keyword in ['SELECT', 'SHOW', 'DESCRIBE', 'UPDATE', 'INSERT']):
+                return sql_query(message, instance)
+            else:
+                return f"✅ Instance name set to {instance}. You can now run SQL queries."
+    
+    # Method 3: Extract from patterns like "use DA3" or "connect to DB3"
+    import re
+    patterns = [
+        r'(?:use|connect\s+to|instance)\s+([A-Z0-9]{3})',
+        r'([A-Z0-9]{3})\s+(?:instance|database)',
+        r'(?:set|select)\s+([A-Z0-9]{3})'
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, message_upper)
+        if match:
+            potential_instance = match.group(1)
+            if potential_instance in valid_instance:
+                session_context["instance_name"] = potential_instance
+                return f"✅ Instance name set to {potential_instance}. You can now run SQL queries."
+    
+    # Method 4: If it's a SQL query without instance context
+    if any(keyword in message_upper for keyword in ['SELECT', 'SHOW', 'DESCRIBE', 'UPDATE', 'INSERT']):
+        current_instance = session_context.get("instance_name")
+        if current_instance:
+            # We have instance context, execute the query
+            return sql_query(message, current_instance)
+        else:
+            # No instance context, ask for it
+            return f"❗ Please specify the database instance first. Available instances: {', '.join(valid_instance)}"
+    
+    # Method 5: General response for non-SQL messages
+    current_instance = session_context.get("instance_name")
+    if current_instance:
+        return f"Current instance: {current_instance}. Please provide your SQL query."
+    else:
+        return f"Please specify the database instance first. Available instances: {', '.join(valid_instance)}"
+
+# FIXED: Tool definition with better parameter handling
+from langchain.tools import tool
+
+@tool
+def sql_database_query(query_input: str) -> str:
+    """
+    Execute SQL queries on AutoSys database instances.
+    
+    This tool can handle:
+    1. Instance name specification: "use DA3", "connect to DB3", or just "DA3"
+    2. SQL queries: SELECT, UPDATE, INSERT, DELETE, DESCRIBE, SHOW
+    3. Combined input: "DA3 SELECT * FROM jobs" 
+    
+    Valid instances: DA3, DB3, DC3, DG3, LS3
+    
+    Args:
+        query_input: Either an instance name, SQL query, or both combined
+    
+    Returns:
+        Query results or instance confirmation message
+    """
+    try:
+        return enhanced_handle_message(query_input)
+    except Exception as e:
+        logging.error(f"SQL tool error: {str(e)}")
+        return f"❌ Error processing request: {str(e)}"
+
+# TESTING FUNCTIONS
+def test_instance_handling():
+    """Test the instance name handling"""
+    
+    print("🧪 TESTING INSTANCE NAME HANDLING")
+    print("=" * 50)
+    
+    # Reset session
+    session_context["instance_name"] = None
+    
+    test_cases = [
+        # Instance name only
+        "DA3",
+        "use DB3", 
+        "connect to DC3",
+        
+        # SQL queries without instance (should ask for instance)
+        "SELECT * FROM jobs",
+        
+        # Combined instance + query
+        "DA3 SELECT * FROM jobs WHERE status = 'RUNNING'",
+        "use DB3 and show tables",
+        
+        # After setting instance, run query
+        "SELECT count(*) FROM jobs"
+    ]
+    
+    for i, test_input in enumerate(test_cases, 1):
+        print(f"\n{i}. Input: '{test_input}'")
+        result = enhanced_handle_message(test_input)
+        print(f"   Result: {result}")
+        print(f"   Session instance: {session_context.get('instance_name', 'None')}")
+        print("-" * 30)
+
+def create_langchain_agent_with_fixed_tool():
+    """Create LangChain agent with the fixed SQL tool"""
+    
+    from langchain.chat_models import ChatOpenAI
+    from langchain.agents import initialize_agent, AgentType
+    
+    # Initialize LLM
+    llm = ChatOpenAI(
+        temperature=0,
+        model="gpt-4",
+        api_key="your-openai-api-key"
+    )
+    
+    # Create tools list with our fixed SQL tool
+    tools = [sql_database_query]
+    
+    # Create agent with specific instructions
+    agent = initialize_agent(
+        tools=tools,
+        llm=llm,
+        agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
+        verbose=True,
+        handle_parsing_errors=True,
+        agent_kwargs={
+            "prefix": """You are a helpful AutoSys database assistant. 
+
+IMPORTANT INSTRUCTIONS:
+1. Always use the sql_database_query tool for database operations
+2. Valid instances are: DA3, DB3, DC3, DG3, LS3  
+3. If user doesn't specify instance, the tool will ask for it
+4. You can pass instance name and query together: "DA3 SELECT * FROM jobs"
+
+Available tools:"""
+        }
+    )
+    
+    return agent
+
+# USAGE EXAMPLES
+if __name__ == "__main__":
+    # Test the fixed instance handling
+    test_instance_handling()
+    
+    print("\n" + "=" * 60)
+    print("FIXED SQL TOOL READY")
+    print("=" * 60)
+    
+    print("\nKey fixes applied:")
+    print("✅ Better instance name detection from user input")
+    print("✅ Support for combined instance + query input")  
+    print("✅ Persistent session context")
+    print("✅ Clear error messages and confirmations")
+    print("✅ Multiple input pattern recognition")
+    
+    print("\nExample usage:")
+    print("- 'DA3' → Sets instance to DA3")
+    print("- 'DA3 SELECT * FROM jobs' → Sets instance and runs query")
+    print("- 'use DB3' → Sets instance to DB3")
+    print("- 'SELECT * FROM jobs' → Runs on current instance")
+    
+    # Example of creating the agent
+    try:
+        agent = create_langchain_agent_with_fixed_tool()
+        print("\n✅ LangChain agent created successfully!")
+        
+        # Test with agent
+        test_queries = [
+            "Set instance to DA3",
+            "Show me all running jobs",
+            "DA3 SELECT count(*) FROM jobs WHERE status = 'SUCCESS'"
+        ]
+        
+        for query in test_queries:
+            print(f"\nQuery: {query}")
+            try:
+                response = agent.run(query)
+                print(f"Response: {response}")
+            except Exception as e:
+                print(f"Error: {e}")
+                
+    except Exception as e:
+        print(f"⚠️ Agent creation failed: {e}")
+        print("Make sure to set your OpenAI API key")
+
 ###########££££
 import requests
 import re
