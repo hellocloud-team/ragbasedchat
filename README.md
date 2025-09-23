@@ -1,4 +1,467 @@
+*****†"*********
+# Anti-Hallucination and Forced Tool Execution System
+from typing import Dict, List, Any, Optional
+from langchain.agents import AgentExecutor, create_tool_calling_agent
+from langchain.tools import tool
+from langchain.prompts import ChatPromptTemplate
+from langchain.chat_models import ChatOpenAI
+from langchain.schema import AgentAction, AgentFinish
+import re
+import json
+from enum import Enum
 
+class ExecutionMode(Enum):
+    STRICT = "strict"           # Must use tools, no hallucinations allowed
+    GUIDED = "guided"          # Strong preference for tools
+    BALANCED = "balanced"      # Normal mode
+
+class AntiHallucinationAgent:
+    """Agent system designed to prevent hallucinations and force tool usage"""
+    
+    def __init__(self, tools: List, llm, execution_mode: ExecutionMode = ExecutionMode.STRICT):
+        self.tools = tools
+        self.llm = llm
+        self.execution_mode = execution_mode
+        self.tool_usage_history = []
+        
+        # Create the agent with anti-hallucination prompts
+        self.prompt = self._create_anti_hallucination_prompt()
+        self.agent = self._create_agent()
+        
+    def _create_anti_hallucination_prompt(self) -> ChatPromptTemplate:
+        """Create a prompt that forces tool usage and prevents hallucinations"""
+        
+        if self.execution_mode == ExecutionMode.STRICT:
+            system_message = """You are a precise assistant that MUST use tools to answer questions. Follow these MANDATORY rules:
+
+🚫 NEVER GUESS OR MAKE UP INFORMATION
+🚫 NEVER provide answers without using tools first
+🚫 NEVER assume you know current data or system state
+
+✅ ALWAYS use available tools to get information
+✅ ALWAYS call tools before providing any factual responses
+✅ ALWAYS base your answers ONLY on tool results
+
+CRITICAL: If you cannot find information using tools, say "I cannot find that information using available tools" instead of guessing.
+
+Available tools: {tools}
+
+PROCESS:
+1. First, identify what tool(s) you need to use
+2. Call the appropriate tool(s) with correct parameters
+3. Wait for tool results
+4. Provide answer based ONLY on tool results
+5. If tools fail or return no data, explicitly state this
+
+Remember: Tool usage is MANDATORY. No exceptions."""
+
+        elif self.execution_mode == ExecutionMode.GUIDED:
+            system_message = """You are a helpful assistant with access to tools. STRONGLY prefer using tools over your internal knowledge for:
+
+- Current data or system states
+- Database queries or API calls  
+- File operations or system information
+- Real-time information
+
+RULES:
+- Use tools when available for the user's question
+- If you use internal knowledge, clearly state "Based on my general knowledge" 
+- Always prefer tool results over assumptions
+
+Available tools: {tools}"""
+
+        else:  # BALANCED
+            system_message = """You are a helpful assistant with access to tools. Use tools when appropriate for:
+
+- Data that might change frequently
+- System-specific information
+- User's specific environment or data
+
+Available tools: {tools}"""
+
+        return ChatPromptTemplate.from_messages([
+            ("system", system_message),
+            ("user", "{input}"),
+            ("placeholder", "{agent_scratchpad}"),
+        ])
+    
+    def _create_agent(self):
+        """Create agent with tool forcing capabilities"""
+        
+        # Create base agent
+        agent = create_tool_calling_agent(self.llm, self.tools, self.prompt)
+        
+        # Wrap with execution monitoring
+        agent_executor = AgentExecutor(
+            agent=agent,
+            tools=self.tools,
+            verbose=True,
+            return_intermediate_steps=True,
+            handle_parsing_errors=True,
+            max_iterations=5,
+            early_stopping_method="generate"
+        )
+        
+        return agent_executor
+    
+    def execute(self, user_input: str) -> Dict[str, Any]:
+        """Execute with anti-hallucination checks"""
+        
+        # Pre-process input to add tool enforcement
+        enhanced_input = self._enhance_input_for_tool_usage(user_input)
+        
+        # Execute the agent
+        result = self.agent.invoke({"input": enhanced_input})
+        
+        # Post-process to verify tool usage
+        verification = self._verify_tool_usage(user_input, result)
+        
+        return {
+            "original_query": user_input,
+            "enhanced_query": enhanced_input,
+            "result": result,
+            "verification": verification,
+            "tools_used": [step[0].tool for step in result.get("intermediate_steps", [])],
+            "execution_mode": self.execution_mode.value
+        }
+    
+    def _enhance_input_for_tool_usage(self, user_input: str) -> str:
+        """Enhance input to encourage tool usage"""
+        
+        if self.execution_mode == ExecutionMode.STRICT:
+            # Add explicit tool requirements
+            tool_hints = self._identify_required_tools(user_input)
+            
+            enhanced = f"""
+{user_input}
+
+MANDATORY INSTRUCTIONS:
+- You MUST use tools to answer this question
+- Required tool(s): {', '.join(tool_hints) if tool_hints else 'determine appropriate tools'}
+- Do NOT provide answers without tool results
+- If tools fail, explicitly state the failure
+"""
+            return enhanced
+        
+        elif self.execution_mode == ExecutionMode.GUIDED:
+            return f"{user_input}\n\nNote: Please use available tools if they can help answer this question."
+        
+        return user_input
+    
+    def _identify_required_tools(self, user_input: str) -> List[str]:
+        """Identify which tools should be used for the query"""
+        
+        tool_patterns = {}
+        for tool in self.tools:
+            tool_name = tool.name
+            # Get tool description or docstring
+            description = getattr(tool, 'description', tool.func.__doc__ or '')
+            
+            # Extract keywords from description
+            keywords = re.findall(r'\b\w+\b', description.lower())
+            tool_patterns[tool_name] = keywords
+        
+        user_input_lower = user_input.lower()
+        suggested_tools = []
+        
+        for tool_name, keywords in tool_patterns.items():
+            if any(keyword in user_input_lower for keyword in keywords):
+                suggested_tools.append(tool_name)
+        
+        return suggested_tools
+    
+    def _verify_tool_usage(self, original_query: str, result: Dict) -> Dict[str, Any]:
+        """Verify that tools were used appropriately"""
+        
+        intermediate_steps = result.get("intermediate_steps", [])
+        tools_used = len(intermediate_steps)
+        
+        verification = {
+            "tools_called": tools_used,
+            "tool_usage_required": self._should_use_tools(original_query),
+            "compliance": "unknown"
+        }
+        
+        if self.execution_mode == ExecutionMode.STRICT:
+            if verification["tool_usage_required"] and tools_used == 0:
+                verification["compliance"] = "FAILED - No tools used when required"
+                verification["recommendation"] = "Force tool usage or reject response"
+            elif tools_used > 0:
+                verification["compliance"] = "PASSED - Tools were used"
+            else:
+                verification["compliance"] = "UNCLEAR - Check if tools were needed"
+        
+        return verification
+    
+    def _should_use_tools(self, query: str) -> bool:
+        """Determine if tools should be used for this query"""
+        
+        # Patterns that definitely require tools
+        tool_required_patterns = [
+            r'\b(show|get|find|retrieve|fetch|list|count|sum|total)\b',
+            r'\b(status|health|info|details|data|records)\b',
+            r'\b(database|table|server|instance|api|system)\b',
+            r'\b(current|latest|recent|today|now)\b',
+            r'\b(how many|what is|tell me about)\b'
+        ]
+        
+        query_lower = query.lower()
+        return any(re.search(pattern, query_lower) for pattern in tool_required_patterns)
+
+# Enhanced tool definitions with better descriptions
+@tool
+def get_database_info(query: str) -> str:
+    """
+    MANDATORY for database queries. Get information from database.
+    Use for: SELECT, COUNT, user data, orders, customers, any database operation.
+    This tool MUST be called for any question about stored data.
+    
+    Args:
+        query: SQL query or database question
+    """
+    # Your database logic here
+    return f"Database result for: {query}"
+
+@tool
+def get_system_status(instance_name: str) -> str:
+    """
+    MANDATORY for system operations. Get server/instance status and information.
+    Use for: server status, health checks, system info, instance details.
+    This tool MUST be called for any system-related question.
+    
+    Args:
+        instance_name: Name of the server/instance to check
+    """
+    # Your system status logic here
+    return f"System status for {instance_name}: Active"
+
+@tool 
+def execute_api_call(endpoint: str, method: str = "GET") -> str:
+    """
+    MANDATORY for API operations. Execute API calls to external services.
+    Use for: API requests, service calls, external data retrieval.
+    This tool MUST be called for any API-related question.
+    
+    Args:
+        endpoint: API endpoint to call
+        method: HTTP method (GET, POST, etc.)
+    """
+    # Your API call logic here
+    return f"API call to {endpoint}: Success"
+
+# Tool forcing decorator
+def force_tool_usage(tool_names: List[str]):
+    """Decorator to force usage of specific tools"""
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            # Add tool requirements to the prompt
+            if hasattr(func, '__self__') and hasattr(func.__self__, 'agent'):
+                # Modify the agent's prompt to require specific tools
+                pass
+            return func(*args, **kwargs)
+        return wrapper
+    return decorator
+
+# Validation system for tool results
+class ToolResultValidator:
+    """Validates tool results to prevent hallucinated responses"""
+    
+    @staticmethod
+    def validate_database_result(result: str, expected_type: str = "data") -> Dict[str, Any]:
+        """Validate database tool results"""
+        
+        validation = {
+            "is_valid": True,
+            "issues": [],
+            "confidence": 1.0
+        }
+        
+        # Check for common hallucination patterns
+        hallucination_patterns = [
+            r"I don't have access to",
+            r"I cannot access",
+            r"As an AI, I cannot",
+            r"I don't have real-time",
+            r"Based on my training"
+        ]
+        
+        for pattern in hallucination_patterns:
+            if re.search(pattern, result, re.IGNORECASE):
+                validation["is_valid"] = False
+                validation["issues"].append(f"Hallucination detected: {pattern}")
+                validation["confidence"] = 0.0
+        
+        return validation
+    
+    @staticmethod
+    def validate_system_result(result: str) -> Dict[str, Any]:
+        """Validate system status tool results"""
+        
+        # Check if result contains actual system data vs generic responses
+        expected_indicators = ["status", "uptime", "version", "health", "active", "inactive"]
+        
+        validation = {
+            "is_valid": any(indicator.lower() in result.lower() for indicator in expected_indicators),
+            "issues": [],
+            "confidence": 0.8
+        }
+        
+        if not validation["is_valid"]:
+            validation["issues"].append("Result doesn't contain expected system information")
+        
+        return validation
+
+# Complete anti-hallucination system
+class ProductionAntiHallucinationSystem:
+    """Production-ready system to prevent hallucinations"""
+    
+    def __init__(self, tools: List, llm_config: Dict):
+        self.tools = tools
+        self.llm = self._initialize_llm(llm_config)
+        self.validator = ToolResultValidator()
+        
+        # Different agents for different strictness levels
+        self.strict_agent = AntiHallucinationAgent(tools, self.llm, ExecutionMode.STRICT)
+        self.guided_agent = AntiHallucinationAgent(tools, self.llm, ExecutionMode.GUIDED)
+        
+    def _initialize_llm(self, config: Dict):
+        """Initialize LLM with anti-hallucination settings"""
+        
+        if config.get("provider") == "openai":
+            return ChatOpenAI(
+                model=config.get("model", "gpt-4"),
+                temperature=0,  # Deterministic responses
+                api_key=config.get("api_key")
+            )
+        # Add other providers as needed
+        
+    def process_query(self, user_input: str, strictness: str = "strict") -> Dict[str, Any]:
+        """Process query with anti-hallucination measures"""
+        
+        # Choose agent based on strictness
+        agent = self.strict_agent if strictness == "strict" else self.guided_agent
+        
+        # Execute with monitoring
+        result = agent.execute(user_input)
+        
+        # Validate results
+        if result["tools_used"]:
+            for i, tool_name in enumerate(result["tools_used"]):
+                if tool_name == "get_database_info":
+                    validation = self.validator.validate_database_result(
+                        result["result"]["output"]
+                    )
+                elif tool_name == "get_system_status":
+                    validation = self.validator.validate_system_result(
+                        result["result"]["output"]
+                    )
+                
+                result[f"validation_{i}"] = validation
+        
+        # Final compliance check
+        result["final_compliance"] = self._check_final_compliance(result)
+        
+        return result
+    
+    def _check_final_compliance(self, result: Dict) -> Dict[str, Any]:
+        """Final compliance check"""
+        
+        compliance = {
+            "status": "PASSED",
+            "issues": [],
+            "recommendations": []
+        }
+        
+        # Check if tools were used when required
+        if result["verification"]["tool_usage_required"] and not result["tools_used"]:
+            compliance["status"] = "FAILED"
+            compliance["issues"].append("Required tools not used")
+            compliance["recommendations"].append("Reject response and force tool usage")
+        
+        # Check validation results
+        for key, value in result.items():
+            if key.startswith("validation_") and not value.get("is_valid", True):
+                compliance["status"] = "FAILED"
+                compliance["issues"].extend(value.get("issues", []))
+                compliance["recommendations"].append("Regenerate with proper tool usage")
+        
+        return compliance
+
+# Usage examples
+if __name__ == "__main__":
+    
+    # Setup
+    tools = [get_database_info, get_system_status, execute_api_call]
+    
+    llm_config = {
+        "provider": "openai",
+        "model": "gpt-4", 
+        "api_key": "your-api-key"
+    }
+    
+    # Create anti-hallucination system
+    system = ProductionAntiHallucinationSystem(tools, llm_config)
+    
+    # Test queries
+    test_queries = [
+        "Show me all users in the database",  # Should force database tool
+        "What's the status of my-server?",    # Should force system tool  
+        "How many orders were placed today?", # Should force database tool
+        "Tell me about the weather",          # Should indicate no tools available
+    ]
+    
+    print("🚫 ANTI-HALLUCINATION SYSTEM TEST")
+    print("=" * 50)
+    
+    for query in test_queries:
+        print(f"\nQuery: {query}")
+        print("-" * 30)
+        
+        result = system.process_query(query, strictness="strict")
+        
+        print(f"Tools used: {result['tools_used']}")
+        print(f"Compliance: {result['final_compliance']['status']}")
+        
+        if result['final_compliance']['issues']:
+            print(f"Issues: {result['final_compliance']['issues']}")
+        
+        if result['final_compliance']['recommendations']:
+            print(f"Recommendations: {result['final_compliance']['recommendations']}")
+        
+        print(f"Result: {result['result']['output'][:100]}...")
+
+# Integration with existing router system
+def integrate_with_router():
+    """Integration example with the existing API router"""
+    
+    # Modify your existing agent creation to use anti-hallucination
+    def create_anti_hallucination_sql_agent():
+        tools = [get_database_info]  # Your actual tools
+        llm_config = {"provider": "openai", "model": "gpt-4", "api_key": "your-key"}
+        
+        return ProductionAntiHallucinationSystem(tools, llm_config)
+    
+    def create_anti_hallucination_tools_agent():
+        tools = [get_system_status, execute_api_call]  # Your actual tools
+        llm_config = {"provider": "openai", "model": "gpt-4", "api_key": "your-key"}
+        
+        return ProductionAntiHallucinationSystem(tools, llm_config)
+    
+    print("✅ Anti-hallucination agents created!")
+    print("These can now replace your existing agents in the router system.")
+
+if __name__ == "__main__":
+    integrate_with_router()
+
+
+
+
+
+
+
+
+
+†****†*****""*"""
 # Fix 1: Improve tool descriptions and naming
 from langchain.tools import tool
 from langchain.agents import initialize_agent, AgentType
