@@ -1,1990 +1,4 @@
-xxxxxxxxxxxxx
-# SOLUTION FOR UI vs API TOOL EXECUTION INCONSISTENCY
 
-import json
-import logging
-from typing import Dict, Any, Optional
-from langchain.tools import tool
-from langchain.agents import AgentExecutor, create_tool_calling_agent
-from langchain.prompts import ChatPromptTemplate
-from langchain.chat_models import ChatOpenAI
-from langchain.schema import BaseMessage
-from flask import Flask, request, jsonify
-
-# PROBLEM DIAGNOSIS: Common causes of UI vs API inconsistency
-"""
-Common Reasons for UI/API Tool Execution Inconsistency:
-
-1. DIFFERENT AGENT INITIALIZATION
-   - UI and API using different agent creation methods
-   - Different prompts between UI and API
-   - Different LLM settings (temperature, model, etc.)
-
-2. DIFFERENT TOOL CONFIGURATIONS
-   - Tools defined differently in UI vs API
-   - Tool descriptions vary between implementations
-   - Missing tools in one implementation
-
-3. CONVERSATION CONTEXT ISSUES
-   - UI maintains conversation history differently
-   - Session state not shared between UI and API
-   - Context window differences
-
-4. LLM PROVIDER DIFFERENCES
-   - Different API keys or endpoints
-   - Rate limiting affecting one but not the other
-   - Model version differences
-
-5. ERROR HANDLING DIFFERENCES
-   - UI swallows errors that API shows
-   - Different timeout settings
-   - Parsing error handling varies
-"""
-
-# UNIFIED AGENT FACTORY - USE THIS FOR BOTH UI AND API
-class UnifiedAgentFactory:
-    """Creates consistent agents for both UI and API"""
-    
-    def __init__(self, config: Dict[str, Any]):
-        self.config = config
-        self.tools = self._initialize_tools()
-        self.llm = self._initialize_llm()
-        self.prompt = self._create_consistent_prompt()
-        
-    def _initialize_tools(self):
-        """Initialize tools consistently"""
-        return [smart_sql_database_query]  # Your actual tools here
-    
-    def _initialize_llm(self):
-        """Initialize LLM with consistent settings"""
-        return ChatOpenAI(
-            model=self.config.get("model", "gpt-4"),
-            temperature=self.config.get("temperature", 0),
-            api_key=self.config.get("api_key"),
-            max_tokens=self.config.get("max_tokens", 2000),
-            timeout=self.config.get("timeout", 30)
-        )
-    
-    def _create_consistent_prompt(self):
-        """Create consistent prompt for both UI and API"""
-        
-        system_message = """You are an AutoSys database assistant. You MUST follow these rules:
-
-🚫 CRITICAL - NEVER RESPOND WITHOUT CALLING TOOLS:
-1. For ANY user question, you MUST call the smart_sql_database_query tool first
-2. NEVER provide direct answers without using tools
-3. NEVER say "I don't have access" without calling tools
-4. ALWAYS wait for tool results before responding
-
-✅ MANDATORY PROCESS:
-1. User asks anything → Call smart_sql_database_query tool
-2. Wait for tool response
-3. Format the tool response for the user
-4. If tool fails, report the failure clearly
-
-🔧 Available tools: {tools}
-
-Remember: TOOL USAGE IS MANDATORY for ALL queries."""
-
-        return ChatPromptTemplate.from_messages([
-            ("system", system_message),
-            ("user", "{input}"),
-            ("placeholder", "{agent_scratchpad}"),
-        ])
-    
-    def create_agent(self) -> AgentExecutor:
-        """Create agent with forced tool execution"""
-        
-        # Create base agent
-        agent = create_tool_calling_agent(
-            self.llm, 
-            self.tools, 
-            self.prompt
-        )
-        
-        # Create executor with consistent settings
-        agent_executor = AgentExecutor(
-            agent=agent,
-            tools=self.tools,
-            verbose=self.config.get("verbose", True),
-            return_intermediate_steps=True,
-            handle_parsing_errors=True,
-            max_iterations=self.config.get("max_iterations", 3),
-            early_stopping_method="generate"
-        )
-        
-        return agent_executor
-
-# CONSISTENT EXECUTION WRAPPER
-class ConsistentAgentWrapper:
-    """Wrapper that ensures consistent behavior across UI and API"""
-    
-    def __init__(self, agent_executor: AgentExecutor):
-        self.agent_executor = agent_executor
-        self.execution_log = []
-    
-    def execute(self, user_input: str, context: Dict = None) -> Dict[str, Any]:
-        """Execute with consistent validation and logging"""
-        
-        execution_id = len(self.execution_log)
-        log_entry = {
-            "id": execution_id,
-            "input": user_input,
-            "context": context or {},
-            "timestamp": "2024-01-01T00:00:00Z",  # Replace with actual timestamp
-            "tools_called": [],
-            "success": False,
-            "output": None,
-            "error": None
-        }
-        
-        try:
-            logging.info(f"🚀 Execution {execution_id}: {user_input}")
-            
-            # Execute agent
-            result = self.agent_executor.invoke({"input": user_input})
-            
-            # Extract tool usage information
-            intermediate_steps = result.get("intermediate_steps", [])
-            tools_called = [step[0].tool for step in intermediate_steps]
-            
-            log_entry.update({
-                "tools_called": tools_called,
-                "success": True,
-                "output": result.get("output"),
-                "intermediate_steps": len(intermediate_steps)
-            })
-            
-            # Validate tool execution
-            validation_result = self._validate_tool_execution(user_input, result)
-            
-            # Log and store
-            self.execution_log.append(log_entry)
-            
-            return {
-                "success": True,
-                "output": result.get("output"),
-                "tools_called": tools_called,
-                "validation": validation_result,
-                "execution_id": execution_id,
-                "debug_info": {
-                    "intermediate_steps": len(intermediate_steps),
-                    "agent_type": type(self.agent_executor.agent).__name__
-                }
-            }
-            
-        except Exception as e:
-            error_msg = str(e)
-            logging.error(f"❌ Execution {execution_id} failed: {error_msg}")
-            
-            log_entry.update({
-                "success": False,
-                "error": error_msg
-            })
-            self.execution_log.append(log_entry)
-            
-            return {
-                "success": False,
-                "error": error_msg,
-                "execution_id": execution_id,
-                "fallback_result": self._emergency_tool_call(user_input)
-            }
-    
-    def _validate_tool_execution(self, user_input: str, result: Dict) -> Dict:
-        """Validate that tools were called appropriately"""
-        
-        intermediate_steps = result.get("intermediate_steps", [])
-        tools_called_count = len(intermediate_steps)
-        
-        validation = {
-            "should_call_tools": self._should_call_tools(user_input),
-            "tools_called_count": tools_called_count,
-            "validation_status": "unknown"
-        }
-        
-        if validation["should_call_tools"] and tools_called_count == 0:
-            validation["validation_status"] = "FAILED - No tools called when required"
-        elif tools_called_count > 0:
-            validation["validation_status"] = "PASSED - Tools were called"
-        else:
-            validation["validation_status"] = "UNCLEAR - Review needed"
-        
-        return validation
-    
-    def _should_call_tools(self, user_input: str) -> bool:
-        """Determine if tools should be called for this input"""
-        
-        # For AutoSys queries, almost everything should call tools
-        tool_required_patterns = [
-            r'\b(job|status|instance|database|select|show|count|find|get|what|how)\b',
-            r'\b(da3|db3|dc3|dg3|ls3)\b',
-            r'\b(running|failed|success|pending)\b'
-        ]
-        
-        import re
-        user_lower = user_input.lower()
-        
-        return any(re.search(pattern, user_lower) for pattern in tool_required_patterns)
-    
-    def _emergency_tool_call(self, user_input: str) -> str:
-        """Emergency direct tool call if agent fails"""
-        try:
-            return smart_sql_database_query(user_input)
-        except Exception as e:
-            return f"Emergency tool call failed: {str(e)}"
-    
-    def get_execution_stats(self) -> Dict:
-        """Get execution statistics"""
-        total_executions = len(self.execution_log)
-        successful_executions = sum(1 for log in self.execution_log if log["success"])
-        tools_called_executions = sum(1 for log in self.execution_log if log["tools_called"])
-        
-        return {
-            "total_executions": total_executions,
-            "successful_executions": successful_executions, 
-            "success_rate": f"{(successful_executions/total_executions)*100:.1f}%" if total_executions > 0 else "N/A",
-            "tool_usage_rate": f"{(tools_called_executions/total_executions)*100:.1f}%" if total_executions > 0 else "N/A"
-        }
-
-# FLASK API WITH CONSISTENT AGENT
-def create_consistent_api():
-    """Create API that uses the same agent as UI"""
-    
-    app = Flask(__name__)
-    
-    # Shared configuration
-    config = {
-        "model": "gpt-4",
-        "temperature": 0,
-        "api_key": "your-openai-api-key",
-        "max_tokens": 2000,
-        "timeout": 30,
-        "verbose": True,
-        "max_iterations": 3
-    }
-    
-    # Create consistent agent
-    factory = UnifiedAgentFactory(config)
-    agent_executor = factory.create_agent()
-    agent_wrapper = ConsistentAgentWrapper(agent_executor)
-    
-    @app.route('/chat', methods=['POST'])
-    def api_chat():
-        """API endpoint with consistent agent behavior"""
-        
-        try:
-            data = request.json
-            user_input = data.get('message', '').strip()
-            context = data.get('context', {})
-            
-            if not user_input:
-                return jsonify({"error": "No message provided"}), 400
-            
-            # Execute with consistent wrapper
-            result = agent_wrapper.execute(user_input, context)
-            
-            # Add API-specific metadata
-            result.update({
-                "source": "api",
-                "timestamp": "2024-01-01T00:00:00Z",
-                "config": {
-                    "model": config["model"],
-                    "temperature": config["temperature"]
-                }
-            })
-            
-            return jsonify(result)
-            
-        except Exception as e:
-            return jsonify({
-                "success": False,
-                "error": str(e),
-                "source": "api",
-                "fallback_available": True
-            }), 500
-    
-    @app.route('/debug', methods=['GET'])
-    def debug_info():
-        """Debug endpoint to check agent status"""
-        
-        return jsonify({
-            "agent_type": type(agent_executor.agent).__name__,
-            "tools_available": [tool.name for tool in agent_executor.tools],
-            "execution_stats": agent_wrapper.get_execution_stats(),
-            "config": config
-        })
-    
-    return app, agent_wrapper
-
-# UI INTEGRATION CLASS
-class ConsistentUIIntegration:
-    """Integration class for UI that matches API behavior"""
-    
-    def __init__(self, config: Dict = None):
-        # Use the SAME configuration as API
-        self.config = config or {
-            "model": "gpt-4",
-            "temperature": 0,
-            "api_key": "your-openai-api-key",
-            "max_tokens": 2000,
-            "timeout": 30,
-            "verbose": True,
-            "max_iterations": 3
-        }
-        
-        # Create the SAME agent as API
-        factory = UnifiedAgentFactory(self.config)
-        agent_executor = factory.create_agent()
-        self.agent_wrapper = ConsistentAgentWrapper(agent_executor)
-    
-    def process_ui_message(self, user_input: str, conversation_history: list = None) -> Dict:
-        """Process UI message with same logic as API"""
-        
-        # Add conversation context if available
-        context = {}
-        if conversation_history:
-            context["conversation_history"] = conversation_history[-5:]  # Last 5 messages
-        
-        # Execute with same wrapper as API
-        result = self.agent_wrapper.execute(user_input, context)
-        
-        # Add UI-specific metadata
-        result.update({
-            "source": "ui",
-            "timestamp": "2024-01-01T00:00:00Z",
-            "config": self.config
-        })
-        
-        return result
-    
-    def get_debug_info(self) -> Dict:
-        """Get debug information for UI"""
-        return {
-            "source": "ui",
-            "execution_stats": self.agent_wrapper.get_execution_stats(),
-            "config": self.config
-        }
-
-# STREAMLIT UI EXAMPLE
-def create_consistent_streamlit_ui():
-    """Create Streamlit UI that behaves consistently with API"""
-    
-    import streamlit as st
-    
-    st.title("Consistent AutoSys Assistant")
-    
-    # Initialize UI integration
-    if 'ui_agent' not in st.session_state:
-        st.session_state.ui_agent = ConsistentUIIntegration()
-        st.session_state.messages = []
-    
-    # Display chat messages
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.write(message["content"])
-            if "debug_info" in message:
-                with st.expander("Debug Info"):
-                    st.json(message["debug_info"])
-    
-    # Chat input
-    if prompt := st.chat_input("Ask about AutoSys..."):
-        # Display user message
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.write(prompt)
-        
-        # Process with consistent agent
-        with st.chat_message("assistant"):
-            with st.spinner("Processing..."):
-                result = st.session_state.ui_agent.process_ui_message(
-                    prompt, 
-                    st.session_state.messages
-                )
-                
-                if result["success"]:
-                    st.write(result["output"])
-                    
-                    # Show tool usage info
-                    if result.get("tools_called"):
-                        st.info(f"🔧 Tools used: {', '.join(result['tools_called'])}")
-                    
-                    # Add to messages
-                    st.session_state.messages.append({
-                        "role": "assistant", 
-                        "content": result["output"],
-                        "debug_info": result.get("debug_info", {})
-                    })
-                else:
-                    st.error(f"Error: {result.get('error', 'Unknown error')}")
-                    
-                    # Show fallback result if available
-                    if result.get("fallback_result"):
-                        st.info("Fallback result:")
-                        st.write(result["fallback_result"])
-    
-    # Debug sidebar
-    with st.sidebar:
-        st.header("Debug Information")
-        if st.button("Show Debug Info"):
-            debug_info = st.session_state.ui_agent.get_debug_info()
-            st.json(debug_info)
-
-# TESTING FRAMEWORK
-def test_ui_api_consistency():
-    """Test that UI and API behave consistently"""
-    
-    print("🧪 TESTING UI vs API CONSISTENCY")
-    print("=" * 50)
-    
-    # Create both UI and API agents
-    config = {
-        "model": "gpt-4",
-        "temperature": 0,
-        "api_key": "your-openai-api-key",
-        "verbose": True
-    }
-    
-    ui_integration = ConsistentUIIntegration(config)
-    app, api_wrapper = create_consistent_api()
-    
-    test_queries = [
-        "What is the status of job123?",
-        "DA3 SELECT * FROM jobs",
-        "Show me running jobs on DB3",
-        "What is AutoSys?"
-    ]
-    
-    for query in test_queries:
-        print(f"\nTesting: '{query}'")
-        print("-" * 30)
-        
-        # Test UI
-        ui_result = ui_integration.process_ui_message(query)
-        print(f"UI Tools Called: {ui_result.get('tools_called', [])}")
-        print(f"UI Success: {ui_result.get('success')}")
-        
-        # Test API (simulated)
-        api_result = api_wrapper.execute(query)
-        print(f"API Tools Called: {api_result.get('tools_called', [])}")
-        print(f"API Success: {api_result.get('success')}")
-        
-        # Compare consistency
-        ui_tools = set(ui_result.get('tools_called', []))
-        api_tools = set(api_result.get('tools_called', []))
-        
-        if ui_tools == api_tools and ui_result.get('success') == api_result.get('success'):
-            print("✅ CONSISTENT")
-        else:
-            print("❌ INCONSISTENT")
-            print(f"   UI tools: {ui_tools}")
-            print(f"   API tools: {api_tools}")
-
-if __name__ == "__main__":
-    # Test consistency
-    test_ui_api_consistency()
-    
-    print("\n" + "=" * 60)
-    print("🎯 SOLUTION SUMMARY")
-    print("=" * 60)
-    
-    print("""
-✅ ROOT CAUSES ADDRESSED:
-1. Unified agent factory for both UI and API
-2. Consistent prompts and configurations
-3. Validation and logging for both environments
-4. Emergency fallback mechanisms
-5. Debug information for troubleshooting
-
-✅ IMPLEMENTATION:
-1. Replace UI agent with ConsistentUIIntegration
-2. Replace API agent with create_consistent_api()
-3. Use the same configuration for both
-4. Monitor execution with debug endpoints
-
-✅ GUARANTEED CONSISTENCY:
-- Same LLM settings
-- Same prompts
-- Same tools
-- Same validation logic
-- Same error handling
-""")
-    
-    print("\n🔧 NEXT STEPS:")
-    print("1. Replace your UI agent creation with ConsistentUIIntegration")
-    print("2. Replace your API agent creation with create_consistent_api()") 
-    print("3. Use the same configuration dictionary for both")
-    print("4. Test with the provided test_ui_api_consistency() function")
-    print("5. Monitor with debug endpoints to ensure consistency")
-mmmmmmmmmm
-
-
-zzzzzzzz
-
-# LLM-BASED INSTANCE NAME EXTRACTION AND AUTO-PASSING SYSTEM
-
-import json
-import logging
-from typing import Dict, Optional, Tuple, List
-from langchain.tools import tool
-from langchain.chat_models import ChatOpenAI
-from langchain.prompts import ChatPromptTemplate
-from langchain.schema import BaseMessage
-import re
-
-# Configuration
-valid_instances = {"DA3", "DB3", "DC3", "DG3", "LS3"}
-session_context = {"instance_name": None, "job_name": None, "calendar_name": None}
-
-class LLMInstanceExtractor:
-    """Uses LLM to intelligently extract instance names from user messages"""
-    
-    def __init__(self, llm_config: Dict = None):
-        self.llm_config = llm_config or {
-            "provider": "openai",
-            "model": "gpt-3.5-turbo",  # Fast and cheap for extraction
-            "temperature": 0,
-            "api_key": "your-api-key"
-        }
-        self.llm = self._initialize_llm()
-        
-        # Extraction prompt template
-        self.extraction_prompt = ChatPromptTemplate.from_messages([
-            ("system", self._get_extraction_system_prompt()),
-            ("user", "{user_input}")
-        ])
-    
-    def _initialize_llm(self):
-        """Initialize LLM for instance extraction"""
-        if self.llm_config["provider"] == "openai":
-            return ChatOpenAI(
-                model=self.llm_config["model"],
-                temperature=self.llm_config["temperature"],
-                api_key=self.llm_config["api_key"],
-                max_tokens=50  # Short responses
-            )
-        # Add other providers as needed
-        return None
-    
-    def _get_extraction_system_prompt(self) -> str:
-        """System prompt for instance extraction"""
-        return f"""You are an AutoSys instance name extractor. Your job is to find AutoSys instance names in user messages.
-
-VALID INSTANCES: {', '.join(valid_instances)}
-
-EXTRACTION RULES:
-1. Look for exact matches: DA3, DB3, DC3, DG3, LS3
-2. Look for patterns like: "use DA3", "connect to DB3", "on DC3", "from DG3"
-3. Check for database/AutoSys context: "AutoSys instance DA3", "database DB3"
-4. Consider SQL queries: "DA3 SELECT * FROM jobs"
-
-RESPONSE FORMAT:
-- If instance found: Return ONLY the instance name (e.g., "DA3")
-- If no instance found: Return "NONE"
-- If multiple instances found: Return the first/most relevant one
-
-EXAMPLES:
-User: "What jobs are running on DA3?" → DA3
-User: "Show me DB3 database tables" → DB3  
-User: "use DC3 and run this query" → DC3
-User: "SELECT * FROM jobs" → NONE
-User: "What is the weather?" → NONE
-
-Extract instance name from the user input:"""
-    
-    def extract_instance(self, user_input: str) -> Optional[str]:
-        """Extract instance name using LLM"""
-        try:
-            # First try simple pattern matching (faster)
-            pattern_result = self._pattern_extraction(user_input)
-            if pattern_result:
-                logging.info(f"Pattern extraction found: {pattern_result}")
-                return pattern_result
-            
-            # Fall back to LLM extraction for complex cases
-            if self.llm:
-                response = self.llm.predict(
-                    self.extraction_prompt.format_messages(user_input=user_input)[0].content
-                )
-                
-                extracted = response.strip().upper()
-                logging.info(f"LLM extraction result: '{extracted}'")
-                
-                if extracted in valid_instances:
-                    return extracted
-                elif extracted == "NONE":
-                    return None
-                else:
-                    # LLM returned invalid instance, try pattern matching
-                    return self._pattern_extraction(user_input)
-            
-            return None
-            
-        except Exception as e:
-            logging.error(f"Instance extraction error: {e}")
-            return self._pattern_extraction(user_input)  # Fallback
-    
-    def _pattern_extraction(self, user_input: str) -> Optional[str]:
-        """Fallback pattern-based extraction"""
-        user_upper = user_input.upper()
-        
-        # Direct instance match
-        for instance in valid_instances:
-            if instance in user_upper:
-                return instance
-        
-        return None
-
-class SmartInstanceHandler:
-    """Handles automatic instance passing with LLM intelligence"""
-    
-    def __init__(self, llm_config: Dict = None):
-        self.extractor = LLMInstanceExtractor(llm_config)
-        
-    def process_user_input(self, user_input: str) -> Tuple[str, Optional[str], str]:
-        """
-        Process user input and determine instance handling strategy
-        
-        Returns:
-            (processed_query, extracted_instance, strategy)
-        """
-        
-        # Extract instance name using LLM
-        extracted_instance = self.extractor.extract_instance(user_input)
-        
-        if extracted_instance:
-            # Instance found in input
-            session_context["instance_name"] = extracted_instance
-            
-            # Clean the query (remove instance references for cleaner SQL)
-            cleaned_query = self._clean_query(user_input, extracted_instance)
-            
-            return cleaned_query, extracted_instance, "extracted_and_set"
-        
-        else:
-            # No instance in input - check if query requires instance
-            requires_instance = self._requires_instance_context(user_input)
-            
-            if requires_instance:
-                # Query needs instance but none provided - ask for it
-                current_instance = session_context.get("instance_name")
-                
-                if current_instance:
-                    # We have session context, ask if user wants to use it
-                    return user_input, current_instance, "confirm_session_usage"
-                else:
-                    # No context at all, must ask for instance
-                    return user_input, None, "must_ask_for_instance"
-            else:
-                # Query doesn't require specific instance (general questions)
-                current_instance = session_context.get("instance_name")
-                if current_instance:
-                    return user_input, current_instance, "using_session"
-                else:
-                    return user_input, None, "general_query"
-    
-    def _requires_instance_context(self, user_input: str) -> bool:
-        """
-        Determine if query requires specific instance context
-        Returns True for queries that need instance specification
-        """
-        
-        user_upper = user_input.upper()
-        
-        # Patterns that REQUIRE instance context
-        instance_required_patterns = [
-            # Job-specific queries
-            r'(?:status|state)\s+of\s+job\s*\w+',  # "status of job123"
-            r'job\s+(?:status|state|info|details)',  # "job status", "job info" 
-            r'(?:what|show|get|find)\s+.*job\s*\w+',  # "what is job123", "show job456"
-            r'job\s*\w+\s+(?:status|state|running|failed)',  # "job123 status"
-            
-            # Database/table queries that need specific instance
-            r'(?:select|show|describe|update|insert|delete)',  # SQL queries
-            r'(?:table|database|schema)\s+(?:info|details|status)',
-            r'(?:count|sum|total)\s+.*(?:from|in)',
-            
-            # System-specific queries
-            r'(?:server|instance|system)\s+(?:status|info|health)',
-            r'(?:running|failed|success)\s+(?:jobs|tasks)',
-            r'(?:queue|schedule|calendar)\s+',
-            
-            # Performance/monitoring queries
-            r'(?:performance|metrics|stats|statistics)',
-            r'(?:load|cpu|memory|disk)\s+',
-            r'(?:alert|error|warning|log)',
-            
-            # Time-based queries that need specific instance
-            r'(?:today|yesterday|last\s+\w+)\s+.*(?:jobs|tasks|runs)',
-            r'(?:daily|weekly|monthly)\s+(?:report|summary)',
-        ]
-        
-        for pattern in instance_required_patterns:
-            if re.search(pattern, user_upper):
-                logging.info(f"Instance required - matched pattern: {pattern}")
-                return True
-        
-        # Additional logic: if it contains job names/IDs, likely needs instance
-        if re.search(r'\bjob\s*\w+\b', user_upper):
-            logging.info("Instance required - contains job reference")
-            return True
-        
-        # If it's a SQL query, it needs instance
-        sql_keywords = ['SELECT', 'SHOW', 'DESCRIBE', 'UPDATE', 'INSERT', 'DELETE', 'CREATE', 'DROP']
-        if any(keyword in user_upper for keyword in sql_keywords):
-            logging.info("Instance required - contains SQL keywords")
-            return True
-        
-        return False
-    
-    def _clean_query(self, query: str, instance: str) -> str:
-        """Clean query by removing instance references"""
-        
-        # Remove common instance patterns
-        patterns = [
-            rf'\b{instance}\s+',  # "DA3 SELECT" → "SELECT"
-            rf'(?:use|on|from)\s+{instance}\s*',  # "use DA3" → ""
-            rf'(?:connect\s+to|instance)\s+{instance}\s*',  # "connect to DA3" → ""
-        ]
-        
-        cleaned = query
-        for pattern in patterns:
-            cleaned = re.sub(pattern, '', cleaned, flags=re.IGNORECASE)
-        
-        return cleaned.strip()
-
-# ENHANCED SQL TOOL WITH SMART INSTANCE REQUIREMENT DETECTION
-@tool
-def smart_sql_database_query(user_input: str) -> str:
-    """
-    Smart AutoSys database tool with intelligent instance handling.
-    
-    Behavior:
-    - If instance mentioned in query → Auto-extract and use it
-    - If query requires instance but none provided → Ask for instance
-    - If query doesn't require instance → Answer generally or use session
-    - Maintains conversation context for follow-up queries
-    
-    Args:
-        user_input: User's natural language input
-        
-    Returns:
-        Query results or appropriate response
-    """
-    
-    logging.info(f"🤖 Smart SQL tool called with: '{user_input}'")
-    
-    try:
-        # Initialize smart handler
-        handler = SmartInstanceHandler({
-            "provider": "openai",
-            "model": "gpt-3.5-turbo", 
-            "temperature": 0,
-            "api_key": "your-openai-api-key"  # Set your API key
-        })
-        
-        # Process input with intelligent instance handling
-        processed_query, instance, strategy = handler.process_user_input(user_input)
-        
-        logging.info(f"🧠 Processing strategy: {strategy}")
-        logging.info(f"📍 Instance: {instance}")
-        logging.info(f"🔍 Processed query: '{processed_query}'")
-        
-        if strategy == "extracted_and_set":
-            # Instance was extracted from user input
-            if is_sql_query(processed_query):
-                result = execute_sql_query(processed_query, instance)
-                return f"✅ Executed on {instance}:\n{result}"
-            else:
-                result = execute_sql_query(user_input, instance)
-                return f"✅ Query result from {instance}:\n{result}"
-        
-        elif strategy == "using_session":
-            # Using instance from session context
-            if is_sql_query(user_input):
-                result = execute_sql_query(user_input, instance) 
-                return f"✅ Executed on {instance}:\n{result}"
-            else:
-                result = execute_sql_query(user_input, instance)
-                return f"✅ Query result from {instance}:\n{result}"
-        
-        elif strategy == "confirm_session_usage":
-            # Query needs instance, we have session context, confirm usage
-            return f"❓ Do you want to check this on the current instance ({instance})?\n\nYour query: '{user_input}'\n\nOr specify a different instance: {', '.join(valid_instances)}"
-        
-        elif strategy == "must_ask_for_instance":
-            # Query requires instance but none provided or in session
-            return f"❗ This query requires an AutoSys instance to be specified.\n\n💡 Your query: '{user_input}'\n\n📋 Please specify the instance:\n• Available: {', '.join(valid_instances)}\n• Example: 'Check job status of job123 on DA3'\n• Example: 'DA3 {user_input}'"
-        
-        elif strategy == "general_query":
-            # General question that doesn't require specific instance
-            if any(phrase in user_input.lower() for phrase in ['what is', 'how to', 'explain', 'help', 'what are']):
-                return handle_general_question(user_input)
-            else:
-                # Might still need instance, provide helpful guidance
-                return f"💡 For specific queries, please include the instance name.\n\n📋 Available instances: {', '.join(valid_instances)}\n\nExamples:\n• 'Show jobs on DA3'\n• 'DA3 job status'\n• 'Check DB3 performance'"
-        
-        else:
-            return "❌ Unable to process request - unknown strategy"
-    
-    except Exception as e:
-        logging.error(f"Smart SQL tool error: {e}")
-        return f"❌ Error processing request: {str(e)}"
-
-def handle_general_question(user_input: str) -> str:
-    """Handle general questions that don't require specific instances"""
-    
-    user_lower = user_input.lower()
-    
-    if "instance" in user_lower and ("what" in user_lower or "which" in user_lower):
-        current = session_context.get("instance_name")
-        if current:
-            return f"📍 Current AutoSys instance: {current}\n\n📋 All available instances: {', '.join(valid_instances)}"
-        else:
-            return f"❓ No current instance set.\n\n📋 Available AutoSys instances: {', '.join(valid_instances)}\n\n💡 Set an instance by including it in your query: 'Show jobs on DA3'"
-    
-    elif "job" in user_lower and ("what" in user_lower or "how" in user_lower):
-        return """📚 AutoSys Job Information:
-
-AutoSys jobs are scheduled tasks that run on different instances. To check job information:
-
-🔍 Job Status Queries:
-• "What is the status of job123 on DA3?"
-• "Show job456 details from DB3"
-• "DA3 job789 status"
-
-📊 Job Queries Examples:
-• "Show all running jobs on DC3"
-• "Find failed jobs on DG3"
-• "LS3 job schedule for today"
-
-💡 Always specify the instance (DA3, DB3, DC3, DG3, LS3) for specific job queries."""
-    
-    else:
-        return f"❓ I can help with AutoSys queries!\n\n💡 For specific information, please include:\n• Instance name: {', '.join(valid_instances)}\n• What you want to know\n\nExample: 'What is the status of job123 on DA3?'"
-
-def is_sql_query(query: str) -> bool:
-    """Check if input contains SQL keywords"""
-    sql_keywords = ['SELECT', 'SHOW', 'DESCRIBE', 'UPDATE', 'INSERT', 'DELETE', 'CREATE', 'DROP']
-    query_upper = query.upper()
-    return any(keyword in query_upper for keyword in sql_keywords)
-
-def execute_sql_query(query: str, instance: str) -> str:
-    """Execute SQL query on specified instance"""
-    try:
-        logging.info(f"Executing on {instance}: {query}")
-        
-        # Your actual SQL execution logic here
-        # This is a mock response for demonstration
-        return f"""Query: {query}
-Instance: {instance}
-Status: ✅ Success
-
-[Results would appear here from {instance} database]
-Rows affected: 42
-Execution time: 0.15s"""
-        
-    except Exception as e:
-        return f"❌ SQL execution failed: {str(e)}"
-
-# LLM-POWERED CONVERSATION ANALYZER
-class ConversationContextAnalyzer:
-    """Analyzes conversation context to make better instance decisions"""
-    
-    def __init__(self, llm_config: Dict):
-        self.llm = ChatOpenAI(**llm_config)
-        self.conversation_history = []
-    
-    def analyze_context(self, user_input: str, history: List[str] = None) -> Dict:
-        """Analyze conversation context for better instance handling"""
-        
-        context_prompt = f"""
-        Analyze this AutoSys conversation for instance context:
-        
-        Recent conversation:
-        {chr(10).join(history[-3:]) if history else "No previous context"}
-        
-        Current user input: "{user_input}"
-        
-        Valid instances: {', '.join(valid_instances)}
-        
-        Provide analysis as JSON:
-        {{
-            "instance_mentioned": "DA3|DB3|DC3|DG3|LS3|null",
-            "confidence": "high|medium|low", 
-            "context_clues": ["list", "of", "clues"],
-            "recommended_action": "set_instance|use_session|ask_user"
-        }}
-        """
-        
-        try:
-            response = self.llm.predict(context_prompt)
-            return json.loads(response)
-        except Exception as e:
-            logging.error(f"Context analysis error: {e}")
-            return {
-                "instance_mentioned": None,
-                "confidence": "low",
-                "context_clues": [],
-                "recommended_action": "ask_user"
-            }
-
-# ADVANCED AGENT WITH CONVERSATION AWARENESS
-class ConversationAwareAgent:
-    """Agent that maintains conversation context for better instance handling"""
-    
-    def __init__(self, llm_config: Dict = None):
-        self.handler = SmartInstanceHandler(llm_config)
-        self.analyzer = ConversationContextAnalyzer(llm_config or {
-            "model": "gpt-3.5-turbo",
-            "temperature": 0,
-            "api_key": "your-openai-api-key"
-        })
-        self.conversation_history = []
-    
-    def run(self, user_input: str) -> str:
-        """Process with full conversation awareness"""
-        
-        # Add to conversation history
-        self.conversation_history.append(f"User: {user_input}")
-        
-        # Analyze context
-        context = self.analyzer.analyze_context(user_input, self.conversation_history)
-        
-        # Process with enhanced context
-        if context.get("instance_mentioned") and context.get("confidence") == "high":
-            # High confidence instance detection
-            instance = context["instance_mentioned"]
-            session_context["instance_name"] = instance
-            
-            result = smart_sql_database_query(user_input)
-        else:
-            # Standard processing
-            result = smart_sql_database_query(user_input)
-        
-        # Add result to history
-        self.conversation_history.append(f"Assistant: {result}")
-        
-        # Keep history manageable
-        if len(self.conversation_history) > 10:
-            self.conversation_history = self.conversation_history[-8:]
-        
-        return result
-
-# TESTING AND EXAMPLES
-def test_llm_instance_extraction():
-    """Test LLM-based instance extraction"""
-    
-    print("🧪 TESTING LLM INSTANCE EXTRACTION")
-    print("=" * 50)
-    
-    extractor = LLMInstanceExtractor({
-        "provider": "openai",
-        "model": "gpt-3.5-turbo",
-        "temperature": 0,
-        "api_key": "your-openai-api-key"  # Set your key
-    })
-    
-    test_cases = [
-        "What jobs are running on DA3?",
-        "Show me the DB3 database schema", 
-        "DA3 SELECT * FROM jobs WHERE status='RUNNING'",
-        "Use DC3 and show me all tables",
-        "Connect to DG3 instance",
-        "SELECT count(*) FROM jobs",  # No instance
-        "What's the weather today?",   # No instance
-        "LS3 database backup status"
-    ]
-    
-    for test_input in test_cases:
-        extracted = extractor.extract_instance(test_input)
-        print(f"Input: '{test_input}'")
-        print(f"Extracted: {extracted or 'None'}")
-        print("-" * 30)
-
-def demo_smart_agent():
-    """Demonstrate the smart agent in action"""
-    
-    print("🚀 SMART AGENT DEMONSTRATION")
-    print("=" * 50)
-    
-    agent = ConversationAwareAgent()
-    
-    demo_conversation = [
-        "What jobs are running on DA3?",
-        "Show me failed jobs too",
-        "Now check DB3 status", 
-        "SELECT count(*) FROM jobs",
-        "What about DC3 performance?"
-    ]
-    
-    for message in demo_conversation:
-        print(f"\nUser: {message}")
-        response = agent.run(message)
-        print(f"Agent: {response}")
-        print(f"Session: {session_context.get('instance_name', 'None')}")
-
-# PRODUCTION INTEGRATION
-def create_llm_powered_sql_agent(llm_config: Dict = None):
-    """Create production-ready LLM-powered SQL agent"""
-    
-    return ConversationAwareAgent(llm_config or {
-        "provider": "openai",
-        "model": "gpt-3.5-turbo",  # Fast and cost-effective
-        "temperature": 0,
-        "api_key": "your-openai-api-key"
-    })
-
-# COMPREHENSIVE TESTING FOR CONDITIONAL INSTANCE HANDLING
-def test_conditional_instance_handling():
-    """Test the conditional instance handling logic"""
-    
-    print("🧪 TESTING CONDITIONAL INSTANCE HANDLING")
-    print("=" * 60)
-    
-    # Reset session for clean testing
-    session_context["instance_name"] = None
-    
-    test_scenarios = [
-        # Scenario 1: Instance provided in query
-        {
-            "input": "What is the status of job123 in DA3?",
-            "expected_strategy": "extracted_and_set",
-            "expected_instance": "DA3",
-            "description": "Instance explicitly provided"
-        },
-        
-        # Scenario 2: Job query without instance (should ask)
-        {
-            "input": "What is the status of job123?",
-            "expected_strategy": "must_ask_for_instance", 
-            "expected_instance": None,
-            "description": "Job query without instance - should ask"
-        },
-        
-        # Scenario 3: General question (doesn't need instance)
-        {
-            "input": "What is AutoSys?",
-            "expected_strategy": "general_query",
-            "expected_instance": None, 
-            "description": "General question - no instance needed"
-        },
-        
-        # Scenario 4: SQL query without instance (should ask)
-        {
-            "input": "SELECT * FROM jobs WHERE status='RUNNING'",
-            "expected_strategy": "must_ask_for_instance",
-            "expected_instance": None,
-            "description": "SQL query without instance - should ask"
-        },
-        
-        # Scenario 5: After setting instance, use for follow-up
-        {
-            "setup": lambda: session_context.update({"instance_name": "DB3"}),
-            "input": "Show me failed jobs",
-            "expected_strategy": "using_session",
-            "expected_instance": "DB3", 
-            "description": "Follow-up query using session instance"
-        },
-        
-        # Scenario 6: Job query with session context (confirm usage)
-        {
-            "setup": lambda: session_context.update({"instance_name": "DC3"}),
-            "input": "What is job456 status?",
-            "expected_strategy": "confirm_session_usage",
-            "expected_instance": "DC3",
-            "description": "Job query with session context - should confirm"
-        }
-    ]
-    
-    handler = SmartInstanceHandler()
-    
-    for i, scenario in enumerate(test_scenarios, 1):
-        print(f"\n{i}. {scenario['description']}")
-        print(f"   Input: '{scenario['input']}'")
-        
-        # Setup if needed
-        if 'setup' in scenario:
-            scenario['setup']()
-            print(f"   Setup: Session instance = {session_context.get('instance_name')}")
-        
-        # Process input
-        processed_query, instance, strategy = handler.process_user_input(scenario['input'])
-        
-        print(f"   Strategy: {strategy}")
-        print(f"   Instance: {instance}")
-        print(f"   Expected Strategy: {scenario['expected_strategy']}")
-        print(f"   Expected Instance: {scenario['expected_instance']}")
-        
-        # Check results
-        strategy_match = strategy == scenario['expected_strategy']
-        instance_match = instance == scenario['expected_instance']
-        
-        if strategy_match and instance_match:
-            print("   ✅ PASS")
-        else:
-            print("   ❌ FAIL")
-            if not strategy_match:
-                print(f"      Strategy mismatch: got {strategy}, expected {scenario['expected_strategy']}")
-            if not instance_match:
-                print(f"      Instance mismatch: got {instance}, expected {scenario['expected_instance']}")
-        
-        print("-" * 40)
-        
-        # Reset for next test
-        session_context["instance_name"] = None
-
-def test_complete_conversation_flow():
-    """Test complete conversation flow with mixed scenarios"""
-    
-    print("\n🎭 TESTING COMPLETE CONVERSATION FLOW")
-    print("=" * 60)
-    
-    # Reset session
-    session_context["instance_name"] = None
-    
-    conversation = [
-        ("What is the status of job123?", "Should ask for instance"),
-        ("What is the status of job123 in DA3?", "Should extract DA3 and show status"),
-        ("Show me failed jobs", "Should use DA3 from session"),
-        ("What about job456 status?", "Should confirm DA3 usage or ask"),
-        ("Check DB3 performance", "Should switch to DB3"),
-        ("SELECT count(*) FROM jobs", "Should use DB3"),
-        ("What is AutoSys?", "Should answer generally without needing instance")
-    ]
-    
-    for i, (user_input, expected_behavior) in enumerate(conversation, 1):
-        print(f"\n{i}. User: '{user_input}'")
-        print(f"   Expected: {expected_behavior}")
-        
-        try:
-            response = smart_sql_database_query(user_input)
-            print(f"   Response: {response[:100]}...")
-            print(f"   Session: {session_context.get('instance_name', 'None')}")
-        except Exception as e:
-            print(f"   Error: {e}")
-        
-        print("-" * 50)
-
-def demonstrate_smart_behavior():
-    """Demonstrate the smart conditional behavior"""
-    
-    print("\n🎯 SMART BEHAVIOR DEMONSTRATION")
-    print("=" * 60)
-    
-    examples = {
-        "✅ Auto-Extract Instance": [
-            "What is the status of job123 in DA3?",
-            "Show DB3 job performance", 
-            "DC3 SELECT * FROM jobs"
-        ],
-        
-        "❗ Ask for Instance (Job Queries)": [
-            "What is the status of job123?",
-            "Show me job456 details",
-            "Check job789 performance"
-        ],
-        
-        "❗ Ask for Instance (SQL Queries)": [
-            "SELECT * FROM jobs WHERE status='RUNNING'",
-            "SHOW TABLES",
-            "UPDATE jobs SET status='HOLD'"
-        ],
-        
-        "💡 General Responses (No Instance Needed)": [
-            "What is AutoSys?",
-            "How do jobs work?", 
-            "What instances are available?"
-        ],
-        
-        "🔄 Use Session Context": [
-            # After DA3 is set:
-            "Show me all jobs",
-            "What about performance?",
-            "Run daily report"
-        ]
-    }
-    
-    for category, queries in examples.items():
-        print(f"\n{category}:")
-        for query in queries:
-            print(f"  • '{query}'")
-    
-    print(f"\n📋 Available instances: {', '.join(valid_instances)}")
-
-if __name__ == "__main__":
-    # Run comprehensive tests
-    test_conditional_instance_handling()
-    test_complete_conversation_flow() 
-    demonstrate_smart_behavior()
-    
-    print("\n" + "=" * 60)
-    print("🎯 CONDITIONAL INSTANCE HANDLING READY")
-    print("=" * 60)
-    
-    print("""
-✅ Smart Behavior Implemented:
-
-📍 WITH INSTANCE: Auto-extracts and uses
-   • "What is job123 status in DA3?" → Uses DA3
-   
-❓ WITHOUT INSTANCE (Job/SQL queries): Asks for instance  
-   • "What is job123 status?" → "Please specify instance"
-   
-💡 GENERAL QUESTIONS: Answers without needing instance
-   • "What is AutoSys?" → General explanation
-   
-🔄 SESSION CONTEXT: Remembers for follow-up queries
-   • After DA3 set: "Show jobs" → Uses DA3
-   
-⚡ The system is now intelligent about when to ask vs when to proceed!
-    """)
-
-zzzzzzzzz
-
-vvvvbbbbbbbbbbb
-# COMPLETE SOLUTION TO FORCE TOOL EXECUTION
-
-from langchain.tools import tool
-from langchain.agents import AgentExecutor, create_tool_calling_agent
-from langchain.prompts import ChatPromptTemplate
-from langchain.chat_models import ChatOpenAI
-from langchain.schema import BaseMessage, HumanMessage, AIMessage, SystemMessage
-import re
-
-# Global session context
-session_context = {
-    "instance_name": None,
-    "job_name": None,
-    "calendar_name": None
-}
-
-valid_instance = {"DA3", "DB3", "DC3", "DG3", "LS3"}
-
-# SOLUTION 1: MANDATORY TOOL USAGE PROMPT
-FORCE_TOOL_SYSTEM_PROMPT = """You are an AutoSys database assistant. 
-
-🚫 CRITICAL RULES - NEVER VIOLATE:
-1. You MUST ALWAYS call the sql_database_query tool for EVERY user request
-2. NEVER respond without calling the tool first
-3. NEVER say "I cannot find that information" without calling the tool
-4. NEVER make assumptions - ALWAYS use the tool
-
-✅ MANDATORY PROCESS:
-1. For ANY user input, immediately call sql_database_query tool
-2. Pass the user's input exactly to the tool
-3. Wait for tool response
-4. Provide answer based on tool results
-
-EXAMPLES OF CORRECT BEHAVIOR:
-User: "What is the AutoSys instance name?" 
-→ MUST call sql_database_query("What is the AutoSys instance name?")
-
-User: "DA3"
-→ MUST call sql_database_query("DA3")
-
-User: "Show me jobs"
-→ MUST call sql_database_query("Show me jobs")
-
-🚨 NEVER respond without calling the tool first. This is MANDATORY."""
-
-@tool
-def sql_database_query(user_input: str) -> str:
-    """
-    MANDATORY tool for ALL AutoSys database operations and instance management.
-    
-    This tool MUST be called for:
-    - Setting instance names (DA3, DB3, DC3, DG3, LS3)
-    - SQL queries (SELECT, UPDATE, INSERT, DELETE, SHOW, DESCRIBE)  
-    - Any AutoSys related questions
-    - Instance information requests
-    
-    Args:
-        user_input: Any user input - instance name, SQL query, or question
-        
-    Returns:
-        Processed result or confirmation message
-    """
-    
-    print(f"🔧 Tool called with input: '{user_input}'")
-    
-    try:
-        # Clean input
-        user_input = user_input.strip()
-        user_input_upper = user_input.upper()
-        
-        # Method 1: Direct instance name
-        if user_input_upper in valid_instance:
-            session_context["instance_name"] = user_input_upper
-            return f"✅ Instance name set to {user_input_upper}. You can now run SQL queries on this instance."
-        
-        # Method 2: Instance patterns
-        instance_patterns = [
-            r'(?:instance|use|connect\s+to|set)\s+([A-Z0-9]{3})',
-            r'([A-Z0-9]{3})\s+(?:instance|database)',
-            r'autosys\s+instance\s+(?:is\s+)?([A-Z0-9]{3})',
-            r'what.*instance.*name.*([A-Z0-9]{3})',
-        ]
-        
-        for pattern in instance_patterns:
-            match = re.search(pattern, user_input_upper)
-            if match:
-                potential_instance = match.group(1)
-                if potential_instance in valid_instance:
-                    session_context["instance_name"] = potential_instance
-                    return f"✅ Instance name set to {potential_instance}. You can now run SQL queries on this instance."
-        
-        # Method 3: Find any valid instance in the input
-        found_instances = []
-        for instance in valid_instance:
-            if instance in user_input_upper:
-                found_instances.append(instance)
-        
-        if found_instances:
-            # Use the first found instance
-            selected_instance = found_instances[0]
-            session_context["instance_name"] = selected_instance
-            
-            # Check if it's also a SQL query
-            if any(keyword in user_input_upper for keyword in ['SELECT', 'SHOW', 'DESCRIBE', 'UPDATE', 'INSERT', 'DELETE']):
-                return execute_sql_query(user_input, selected_instance)
-            else:
-                return f"✅ Instance name set to {selected_instance}. You can now run SQL queries on this instance."
-        
-        # Method 4: SQL query with existing instance
-        if any(keyword in user_input_upper for keyword in ['SELECT', 'SHOW', 'DESCRIBE', 'UPDATE', 'INSERT', 'DELETE']):
-            current_instance = session_context.get("instance_name")
-            if current_instance:
-                return execute_sql_query(user_input, current_instance)
-            else:
-                return f"To execute SQL queries, please first specify the instance. Available instances: {', '.join(valid_instance)}. Example: 'DA3'"
-        
-        # Method 5: General instance questions
-        if any(phrase in user_input_upper for phrase in [
-            'INSTANCE NAME', 'AUTOSYS INSTANCE', 'WHAT IS THE', 'WHICH INSTANCE'
-        ]):
-            current_instance = session_context.get("instance_name")
-            if current_instance:
-                return f"Current AutoSys instance is: {current_instance}"
-            else:
-                return f"No instance is currently set. Please specify one of: {', '.join(valid_instance)}"
-        
-        # Method 6: Default response with instance options
-        current_instance = session_context.get("instance_name")
-        if current_instance:
-            return f"Current instance: {current_instance}. Please provide your SQL query or specify a different instance."
-        else:
-            return f"Please specify the AutoSys instance first. Available instances: {', '.join(valid_instance)}. Example: Just type 'DA3'"
-            
-    except Exception as e:
-        return f"❌ Error processing request: {str(e)}"
-
-def execute_sql_query(query: str, instance_name: str) -> str:
-    """Execute SQL query on specified instance"""
-    try:
-        # Your actual SQL execution logic here
-        # For now, return a mock response
-        return f"Executing query on {instance_name}: {query}\n[Query results would appear here]"
-    except Exception as e:
-        return f"❌ Error executing SQL query: {str(e)}"
-
-# SOLUTION 2: AGENT WITH FORCED TOOL USAGE
-def create_forced_tool_agent():
-    """Create agent that ALWAYS calls tools"""
-    
-    llm = ChatOpenAI(
-        model="gpt-4",
-        temperature=0,
-        api_key="your-openai-api-key"
-    )
-    
-    # Force tool usage prompt
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", FORCE_TOOL_SYSTEM_PROMPT),
-        ("user", "{input}"),
-        ("placeholder", "{agent_scratchpad}"),
-    ])
-    
-    tools = [sql_database_query]
-    
-    # Create agent with tool calling
-    agent = create_tool_calling_agent(llm, tools, prompt)
-    
-    # Create executor with strict settings
-    agent_executor = AgentExecutor(
-        agent=agent,
-        tools=tools,
-        verbose=True,
-        handle_parsing_errors=True,
-        return_intermediate_steps=True,
-        max_iterations=3,
-        early_stopping_method="generate"
-    )
-    
-    return agent_executor
-
-# SOLUTION 3: CUSTOM AGENT WITH TOOL VALIDATION
-class ForcedToolAgent:
-    """Custom agent that validates tool usage"""
-    
-    def __init__(self):
-        self.agent = create_forced_tool_agent()
-        
-    def run(self, user_input: str) -> str:
-        """Run with mandatory tool validation"""
-        
-        print(f"📝 User input: {user_input}")
-        
-        # Execute agent
-        result = self.agent.invoke({"input": user_input})
-        
-        # Check if tools were called
-        intermediate_steps = result.get("intermediate_steps", [])
-        tools_called = len(intermediate_steps)
-        
-        print(f"🔍 Tools called: {tools_called}")
-        
-        if tools_called == 0:
-            # Force tool usage if not called
-            print("⚠️ No tools called - forcing tool usage")
-            
-            # Directly call the tool
-            tool_result = sql_database_query(user_input)
-            return f"[Tool executed] {tool_result}"
-        
-        return result["output"]
-
-# SOLUTION 4: OPENAI FUNCTION CALLING (Most Reliable)
-def create_function_calling_agent():
-    """Use OpenAI's function calling for guaranteed tool usage"""
-    
-    from openai import OpenAI
-    import json
-    
-    client = OpenAI(api_key="your-openai-api-key")
-    
-    def process_with_function_calling(user_input: str) -> str:
-        """Process using OpenAI function calling"""
-        
-        # Define function schema
-        functions = [
-            {
-                "name": "sql_database_query",
-                "description": "Execute AutoSys database operations and manage instances",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "user_input": {
-                            "type": "string",
-                            "description": "User's input - instance name, SQL query, or question"
-                        }
-                    },
-                    "required": ["user_input"]
-                }
-            }
-        ]
-        
-        # Make API call with function calling
-        response = client.chat.completions.create(
-            model="gpt-4",
-            messages=[
-                {
-                    "role": "system", 
-                    "content": "You are an AutoSys assistant. For ANY user input, you MUST call the sql_database_query function."
-                },
-                {"role": "user", "content": user_input}
-            ],
-            functions=functions,
-            function_call={"name": "sql_database_query"}  # Force function call
-        )
-        
-        # Check if function was called
-        message = response.choices[0].message
-        
-        if message.function_call:
-            # Extract function arguments
-            function_args = json.loads(message.function_call.arguments)
-            
-            # Call our tool
-            tool_result = sql_database_query(function_args["user_input"])
-            
-            return tool_result
-        else:
-            # Fallback - should not happen with function_call forced
-            return sql_database_query(user_input)
-    
-    return process_with_function_calling
-
-# SOLUTION 5: SIMPLE WRAPPER THAT ALWAYS CALLS TOOL
-class AlwaysCallToolAgent:
-    """Simple wrapper that always calls the tool"""
-    
-    def run(self, user_input: str) -> str:
-        """Always call tool first, then format response"""
-        
-        print(f"🎯 Processing: {user_input}")
-        
-        # Always call the tool
-        tool_result = sql_database_query(user_input)
-        
-        # You can add LLM processing here if needed
-        return tool_result
-
-# TESTING FUNCTION
-def test_all_solutions():
-    """Test all solutions to see which works best"""
-    
-    print("🧪 TESTING ALL SOLUTIONS")
-    print("=" * 60)
-    
-    test_inputs = [
-        "What is the AutoSys instance name?",
-        "DA3",
-        "Show me jobs",
-        "DA3 SELECT * FROM jobs"
-    ]
-    
-    # Test Solution 5 (Simplest and most reliable)
-    print("\n📋 SOLUTION 5: Always Call Tool Agent")
-    print("-" * 40)
-    
-    agent = AlwaysCallToolAgent()
-    
-    for test_input in test_inputs:
-        print(f"\nInput: {test_input}")
-        result = agent.run(test_input)
-        print(f"Result: {result}")
-    
-    return agent
-
-# MAIN SOLUTION - USE THIS IN YOUR APPLICATION
-def create_production_agent():
-    """Create production-ready agent that always calls tools"""
-    
-    # Use the simplest, most reliable solution
-    return AlwaysCallToolAgent()
-
-# INTEGRATION WITH YOUR EXISTING ROUTER
-def integrate_with_router():
-    """How to integrate with your existing API router"""
-    
-    # Replace your SQL agent creation with:
-    def create_sql_agent_api():
-        """Create SQL agent for API"""
-        agent = create_production_agent()
-        
-        def api_handler(request_data):
-            user_input = request_data.get('query', '')
-            result = agent.run(user_input)
-            
-            return {
-                "success": True,
-                "result": result,
-                "agent": "sql_agent",
-                "tool_used": "sql_database_query"
-            }
-        
-        return api_handler
-    
-    print("✅ Integration ready - replace your SQL agent with create_sql_agent_api()")
-
-if __name__ == "__main__":
-    # Test and demonstrate solutions
-    agent = test_all_solutions()
-    
-    print("\n" + "=" * 60)
-    print("🎯 RECOMMENDED SOLUTION")
-    print("=" * 60)
-    
-    print("Use AlwaysCallToolAgent for guaranteed tool execution:")
-    print("""
-    agent = AlwaysCallToolAgent()
-    result = agent.run("What is the AutoSys instance name?")
-    # This WILL call the tool
-    """)
-    
-    print("\n🔧 Key Benefits:")
-    print("✅ Always calls the tool - no exceptions")
-    print("✅ Simple and reliable")
-    print("✅ No complex prompt engineering needed") 
-    print("✅ Works with any user input")
-    print("✅ Easy to integrate with existing code")
-    
-    # Show the integration
-    integrate_with_router()
-
-xxxxxxxxxxxxxxxx
-
-import yaml
-import pandas as pd
-import logging
-from langchain_community.utilities import SQLDatabase
-from langchain_community.tools.sql_database.tool import QuerySQLDataBaseTool
-from langchain.agents import initialize_agent, AgentType
-from langchain_community.utilities import SQLDatabase
-
-# Load config.yaml
-# with open("config.yaml", "r") as f:
-#     config = yaml.safe_load(f)
-
-# Define valid instance names
-valid_instance = {"DA3", "DB3", "DC3", "DG3", "LS3"}
-
-# Global session context to store instance name
-session_context = {
-    "instance_name": None,
-    "job_name": None,
-    "calendar_name": None
-}
-
-def maybe_store_instance_name(message: str):
-    """Extract and store instance name from message"""
-    normalized = message.strip().upper()
-    logging.info(f"Trying to store instance name: {normalized}")
-    
-    # Check if the normalized message is a valid instance name
-    if normalized in valid_instance:
-        session_context["instance_name"] = normalized
-        logging.info(f"Instance name set to: {normalized}")
-        return f"✅ Instance name set to {normalized}."
-    
-    # Check if message contains instance name patterns
-    import re
-    
-    # Pattern 1: "instance: NAME" or "instance NAME"
-    instance_patterns = [
-        r'instance[:\s]+([A-Z0-9]+)',
-        r'using\s+([A-Z0-9]+)',
-        r'connect\s+to\s+([A-Z0-9]+)',
-        r'database\s+([A-Z0-9]+)'
-    ]
-    
-    for pattern in instance_patterns:
-        match = re.search(pattern, normalized)
-        if match:
-            potential_instance = match.group(1)
-            if potential_instance in valid_instance:
-                session_context["instance_name"] = potential_instance
-                logging.info(f"Instance name extracted and set to: {potential_instance}")
-                return f"✅ Instance name set to {potential_instance}."
-    
-    # Check if any valid instance name appears in the message
-    for instance in valid_instance:
-        if instance in normalized:
-            session_context["instance_name"] = instance
-            logging.info(f"Instance name found and set to: {instance}")
-            return f"✅ Instance name set to {instance}."
-    
-    return None
-
-def get_oracle_uri(instance_name: str) -> str:
-    """Get Oracle URI for given instance"""
-    # Replace with your actual config logic
-    # oracle_uri = config["db"].get(instance_name)
-    # For now, return a mock URI
-    oracle_uri = f"oracle://user:pass@host:port/{instance_name}"
-    return oracle_uri
-
-def connect_to_sql_database(instance_name: str) -> SQLDatabase:
-    """Connect to SQL database using instance name"""
-    oracle_uri = get_oracle_uri(instance_name)
-    return SQLDatabase.from_uri(oracle_uri)
-
-def handle_message(message: str):
-    """Handle incoming message and potentially store instance name"""
-    instance_response = maybe_store_instance_name(message)
-    if instance_response:
-        return instance_response
-    
-    # If it's a SQL query but instance is missing, prompt again
-    if "SELECT" in message.upper() and not session_context.get("instance_name"):
-        return "❗ Please provide the AutoSys instance name before running this query."
-    
-    return sql_query(message)
-
-def sql_query(query: str, instance_name: str = None) -> str:
-    """
-    Execute SQL query on specified database instance.
-    
-    Args:
-        query: SQL query to execute
-        instance_name: Database instance name (DA3, DB3, DC3, DG3, LS3)
-    
-    Returns:
-        Query results as formatted string
-    """
-    
-    # FIXED: Use provided instance_name parameter first, then session context
-    if instance_name:
-        current_instance = instance_name
-        # Update session context with provided instance
-        session_context["instance_name"] = instance_name
-        logging.info(f"Using provided instance name: {instance_name}")
-    else:
-        current_instance = session_context.get("instance_name")
-        logging.info(f"Using session instance name: {current_instance}")
-    
-    # Check if instance name is available
-    if not current_instance:
-        logging.warning("Instance name missing in session_context.")
-        return "❗ Please provide the AutoSys instance name before running this query."
-
-    try:
-        # Connect to database
-        db = connect_to_sql_database(current_instance)
-        
-        # Clean and format query
-        formatted_query = query.replace("\\n", "\n").replace("\\'", "'")
-        
-        # Execute query
-        result = db.run(formatted_query)
-        
-        # Convert result to DataFrame for better formatting
-        if isinstance(result, str):
-            # Handle string results (like from DESCRIBE, SHOW commands)
-            if result.strip():
-                lines = result.strip().split('\n')
-                if len(lines) > 1:
-                    # Assume first line is headers
-                    headers = [col.strip() for col in lines[0].split('|') if col.strip()]
-                    data = []
-                    for line in lines[1:]:
-                        row_data = [col.strip() for col in line.split('|') if col.strip()]
-                        if row_data:  # Skip empty rows
-                            data.append(row_data)
-                    
-                    if data and headers:
-                        df = pd.DataFrame(data, columns=headers)
-                        return df.to_string(index=False)
-            
-            return result
-            
-        elif isinstance(result, list):
-            # Handle list results (multiple rows)
-            if result:
-                if all(isinstance(row, dict) for row in result):
-                    # List of dictionaries
-                    df = pd.DataFrame(result)
-                    return df.to_string(index=False)
-                else:
-                    # List of tuples/lists
-                    df = pd.DataFrame(result)
-                    return df.to_string(index=False)
-            else:
-                return "No results found."
-        
-        else:
-            # Handle other result types
-            return f"Query executed successfully. Result: {str(result)}"
-
-    except ValueError as ve:
-        logging.error(f"Value error: {str(ve)}")
-        return f"❌ Data processing error: {str(ve)}"
-    except Exception as e:
-        logging.error(f"Error executing SQL query: {str(e)}")
-        return f"❌ Error executing query: {str(e)}"
-
-# FIXED: Enhanced message handler with better instance detection
-def enhanced_handle_message(message: str):
-    """Enhanced message handler with improved instance name detection"""
-    
-    message_upper = message.upper().strip()
-    
-    # Method 1: Direct instance name check
-    if message_upper in valid_instance:
-        session_context["instance_name"] = message_upper
-        return f"✅ Instance name set to {message_upper}. You can now run SQL queries."
-    
-    # Method 2: Check for instance in the query itself
-    for instance in valid_instance:
-        if instance in message_upper:
-            session_context["instance_name"] = instance
-            logging.info(f"Found instance {instance} in message")
-            
-            # If it's also a SQL query, execute it immediately
-            if any(keyword in message_upper for keyword in ['SELECT', 'SHOW', 'DESCRIBE', 'UPDATE', 'INSERT']):
-                return sql_query(message, instance)
-            else:
-                return f"✅ Instance name set to {instance}. You can now run SQL queries."
-    
-    # Method 3: Extract from patterns like "use DA3" or "connect to DB3"
-    import re
-    patterns = [
-        r'(?:use|connect\s+to|instance)\s+([A-Z0-9]{3})',
-        r'([A-Z0-9]{3})\s+(?:instance|database)',
-        r'(?:set|select)\s+([A-Z0-9]{3})'
-    ]
-    
-    for pattern in patterns:
-        match = re.search(pattern, message_upper)
-        if match:
-            potential_instance = match.group(1)
-            if potential_instance in valid_instance:
-                session_context["instance_name"] = potential_instance
-                return f"✅ Instance name set to {potential_instance}. You can now run SQL queries."
-    
-    # Method 4: If it's a SQL query without instance context
-    if any(keyword in message_upper for keyword in ['SELECT', 'SHOW', 'DESCRIBE', 'UPDATE', 'INSERT']):
-        current_instance = session_context.get("instance_name")
-        if current_instance:
-            # We have instance context, execute the query
-            return sql_query(message, current_instance)
-        else:
-            # No instance context, ask for it
-            return f"❗ Please specify the database instance first. Available instances: {', '.join(valid_instance)}"
-    
-    # Method 5: General response for non-SQL messages
-    current_instance = session_context.get("instance_name")
-    if current_instance:
-        return f"Current instance: {current_instance}. Please provide your SQL query."
-    else:
-        return f"Please specify the database instance first. Available instances: {', '.join(valid_instance)}"
-
-# FIXED: Tool definition with better parameter handling
-from langchain.tools import tool
-
-@tool
-def sql_database_query(query_input: str) -> str:
-    """
-    Execute SQL queries on AutoSys database instances.
-    
-    This tool can handle:
-    1. Instance name specification: "use DA3", "connect to DB3", or just "DA3"
-    2. SQL queries: SELECT, UPDATE, INSERT, DELETE, DESCRIBE, SHOW
-    3. Combined input: "DA3 SELECT * FROM jobs" 
-    
-    Valid instances: DA3, DB3, DC3, DG3, LS3
-    
-    Args:
-        query_input: Either an instance name, SQL query, or both combined
-    
-    Returns:
-        Query results or instance confirmation message
-    """
-    try:
-        return enhanced_handle_message(query_input)
-    except Exception as e:
-        logging.error(f"SQL tool error: {str(e)}")
-        return f"❌ Error processing request: {str(e)}"
-
-# TESTING FUNCTIONS
-def test_instance_handling():
-    """Test the instance name handling"""
-    
-    print("🧪 TESTING INSTANCE NAME HANDLING")
-    print("=" * 50)
-    
-    # Reset session
-    session_context["instance_name"] = None
-    
-    test_cases = [
-        # Instance name only
-        "DA3",
-        "use DB3", 
-        "connect to DC3",
-        
-        # SQL queries without instance (should ask for instance)
-        "SELECT * FROM jobs",
-        
-        # Combined instance + query
-        "DA3 SELECT * FROM jobs WHERE status = 'RUNNING'",
-        "use DB3 and show tables",
-        
-        # After setting instance, run query
-        "SELECT count(*) FROM jobs"
-    ]
-    
-    for i, test_input in enumerate(test_cases, 1):
-        print(f"\n{i}. Input: '{test_input}'")
-        result = enhanced_handle_message(test_input)
-        print(f"   Result: {result}")
-        print(f"   Session instance: {session_context.get('instance_name', 'None')}")
-        print("-" * 30)
-
-def create_langchain_agent_with_fixed_tool():
-    """Create LangChain agent with the fixed SQL tool"""
-    
-    from langchain.chat_models import ChatOpenAI
-    from langchain.agents import initialize_agent, AgentType
-    
-    # Initialize LLM
-    llm = ChatOpenAI(
-        temperature=0,
-        model="gpt-4",
-        api_key="your-openai-api-key"
-    )
-    
-    # Create tools list with our fixed SQL tool
-    tools = [sql_database_query]
-    
-    # Create agent with specific instructions
-    agent = initialize_agent(
-        tools=tools,
-        llm=llm,
-        agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
-        verbose=True,
-        handle_parsing_errors=True,
-        agent_kwargs={
-            "prefix": """You are a helpful AutoSys database assistant. 
-
-IMPORTANT INSTRUCTIONS:
-1. Always use the sql_database_query tool for database operations
-2. Valid instances are: DA3, DB3, DC3, DG3, LS3  
-3. If user doesn't specify instance, the tool will ask for it
-4. You can pass instance name and query together: "DA3 SELECT * FROM jobs"
-
-Available tools:"""
-        }
-    )
-    
-    return agent
-
-# USAGE EXAMPLES
-if __name__ == "__main__":
-    # Test the fixed instance handling
-    test_instance_handling()
-    
-    print("\n" + "=" * 60)
-    print("FIXED SQL TOOL READY")
-    print("=" * 60)
-    
-    print("\nKey fixes applied:")
-    print("✅ Better instance name detection from user input")
-    print("✅ Support for combined instance + query input")  
-    print("✅ Persistent session context")
-    print("✅ Clear error messages and confirmations")
-    print("✅ Multiple input pattern recognition")
-    
-    print("\nExample usage:")
-    print("- 'DA3' → Sets instance to DA3")
-    print("- 'DA3 SELECT * FROM jobs' → Sets instance and runs query")
-    print("- 'use DB3' → Sets instance to DB3")
-    print("- 'SELECT * FROM jobs' → Runs on current instance")
-    
-    # Example of creating the agent
-    try:
-        agent = create_langchain_agent_with_fixed_tool()
-        print("\n✅ LangChain agent created successfully!")
-        
-        # Test with agent
-        test_queries = [
-            "Set instance to DA3",
-            "Show me all running jobs",
-            "DA3 SELECT count(*) FROM jobs WHERE status = 'SUCCESS'"
-        ]
-        
-        for query in test_queries:
-            print(f"\nQuery: {query}")
-            try:
-                response = agent.run(query)
-                print(f"Response: {response}")
-            except Exception as e:
-                print(f"Error: {e}")
-                
-    except Exception as e:
-        print(f"⚠️ Agent creation failed: {e}")
-        print("Make sure to set your OpenAI API key")
-
-###########££££
 import requests
 import re
 from typing import Dict, Any, Optional
@@ -2460,6 +474,1355 @@ def create_flask_app():
     config = APIConfig(
         sql_agent_url="http://localhost:8001/sql-agent",  # Your SQL Agent API
         tools_agent_url="http://localhost:8002/tools-agent",  # Your Tools Agent API
+        timeout=30,
+        headers={"Content-Type": "application/json", "Authorization": "Bearer your-token"}
+    )
+    router = APIAgentRouter(config)
+    
+    @app.route('/chat', methods=['POST'])
+    def chat():
+        try:
+            data = request.json
+            user_input = data.get('message', '').strip()
+            user_context = data.get('context', {})
+            
+            if not user_input:
+                return jsonify({"error": "No message provided"}), 400
+            
+            # Route and call appropriate API
+            result = router.route_and_call(user_input, user_context)
+            
+            return jsonify(result)
+            
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route('/health', methods=['GET'])
+    def health():
+        return jsonify({
+            "status": "healthy",
+            "available_agents": ["sql_agent", "tools_agent"],
+            "endpoints": {
+                "sql_agent": config.sql_agent_url,
+                "tools_agent": config.tools_agent_url
+            }
+        })
+    
+# Performance monitoring and analytics for LLM routing
+class RoutingAnalytics:
+    """Track routing performance and accuracy"""
+    
+    def __init__(self):
+        self.routing_history = []
+        self.accuracy_metrics = {
+            "llm_routing": {"correct": 0, "total": 0},
+            "rule_routing": {"correct": 0, "total": 0}
+        }
+    
+    def log_routing_decision(self, query: str, llm_decision: str, rule_decision: str, actual_success: bool, response_time: float):
+        """Log routing decision for analysis"""
+        entry = {
+            "query": query,
+            "llm_decision": llm_decision,
+            "rule_decision": rule_decision,
+            "actual_success": actual_success,
+            "response_time": response_time,
+            "timestamp": "2024-01-01T00:00:00Z"  # Replace with actual timestamp
+        }
+        self.routing_history.append(entry)
+        
+        # Update accuracy metrics (simplified - in reality you'd need ground truth)
+        if actual_success:
+            self.accuracy_metrics["llm_routing"]["correct"] += 1
+        self.accuracy_metrics["llm_routing"]["total"] += 1
+    
+    def get_routing_stats(self) -> Dict[str, Any]:
+        """Get routing performance statistics"""
+        total_routes = len(self.routing_history)
+        if total_routes == 0:
+            return {"message": "No routing data available"}
+        
+        # Calculate agreement between LLM and rule-based routing
+        agreements = sum(1 for entry in self.routing_history 
+                        if entry["llm_decision"] == entry["rule_decision"])
+        
+        # Calculate average response time
+        avg_response_time = sum(entry["response_time"] for entry in self.routing_history) / total_routes
+        
+        return {
+            "total_queries": total_routes,
+            "llm_rule_agreement": f"{(agreements/total_routes)*100:.1f}%",
+            "avg_response_time": f"{avg_response_time:.2f}s",
+            "success_rate": f"{sum(1 for entry in self.routing_history if entry['actual_success'])/total_routes*100:.1f}%",
+            "routing_distribution": {
+                "sql_agent": sum(1 for entry in self.routing_history if entry["llm_decision"] == "sql_agent"),
+                "tools_agent": sum(1 for entry in self.routing_history if entry["llm_decision"] == "tools_agent"),
+                "unknown": sum(1 for entry in self.routing_history if entry["llm_decision"] == "unknown")
+            }
+        }
+
+# Enhanced router with analytics and confidence scoring
+class EnhancedAPIAgentRouter(APIAgentRouter):
+    """Enhanced router with confidence scoring and analytics"""
+    
+    def __init__(self, config: APIConfig, llm_config: Dict[str, Any] = None):
+        super().__init__(config, llm_config)
+        self.analytics = RoutingAnalytics()
+        self.confidence_threshold = 0.8  # Minimum confidence for LLM routing
+    
+    def route_with_confidence(self, user_input: str, user_context: Dict = None) -> Dict[str, Any]:
+        """Route with confidence scoring"""
+        import time
+        start_time = time.time()
+        
+        try:
+            # Get both LLM and rule-based decisions
+            llm_decision = self._llm_based_routing(user_input)
+            rule_decision = self._rule_based_routing(user_input) 
+            
+            # Calculate confidence based on agreement and other factors
+            confidence = self._calculate_confidence(user_input, llm_decision, rule_decision)
+            
+            # Choose final decision based on confidence
+            if confidence >= self.confidence_threshold:
+                final_decision = llm_decision
+                routing_method = "llm_high_confidence"
+            elif llm_decision == rule_decision:
+                final_decision = llm_decision
+                routing_method = "llm_rule_agreement"
+            else:
+                # Fall back to rule-based if low confidence and disagreement
+                final_decision = rule_decision
+                routing_method = "rule_fallback"
+            
+            # Prepare payload and make API call
+            payload = self._prepare_payload(user_input, user_context)
+            
+            if final_decision == AgentAPI.SQL_AGENT:
+                response = self._call_sql_agent_api(payload)
+            elif final_decision == AgentAPI.TOOLS_AGENT:
+                response = self._call_tools_agent_api(payload)
+            else:
+                response = self._handle_unknown_query(user_input)
+            
+            response_time = time.time() - start_time
+            success = True
+            
+            # Log for analytics
+            self.analytics.log_routing_decision(
+                user_input, llm_decision.value, rule_decision.value, success, response_time
+            )
+            
+            return {
+                "success": True,
+                "agent_used": final_decision.value,
+                "query": user_input,
+                "response": response,
+                "confidence": confidence,
+                "routing_method": routing_method,
+                "llm_decision": llm_decision.value,
+                "rule_decision": rule_decision.value,
+                "response_time": f"{response_time:.2f}s"
+            }
+            
+        except Exception as e:
+            response_time = time.time() - start_time
+            self.analytics.log_routing_decision(
+                user_input, "error", "error", False, response_time
+            )
+            
+            return {
+                "success": False,
+                "error": str(e),
+                "query": user_input,
+                "agent_used": "error",
+                "response_time": f"{response_time:.2f}s"
+            }
+    
+    def _calculate_confidence(self, user_input: str, llm_decision: AgentAPI, rule_decision: AgentAPI) -> float:
+        """Calculate confidence score for routing decision"""
+        
+        confidence = 0.5  # Base confidence
+        
+        # Factor 1: Agreement between LLM and rules (high confidence)
+        if llm_decision == rule_decision and llm_decision != AgentAPI.UNKNOWN:
+            confidence += 0.4
+        
+        # Factor 2: Query clarity (simple patterns get higher confidence)
+        clarity_patterns = [
+            r'\b(select|insert|update|delete)\b',  # Clear SQL
+            r'\b(server|instance).*\b(status|health)\b',  # Clear system ops
+            r'\b(users?|orders?|customers?)\b',  # Clear data queries
+        ]
+        
+        for pattern in clarity_patterns:
+            if re.search(pattern, user_input.lower()):
+                confidence += 0.2
+                break
+        
+        # Factor 3: Query length and complexity (shorter = more confident)
+        word_count = len(user_input.split())
+        if word_count <= 5:
+            confidence += 0.1
+        elif word_count > 15:
+            confidence -= 0.1
+        
+        # Factor 4: Historical accuracy (if available)
+        # This would use historical data to boost confidence
+        
+        return min(confidence, 1.0)  # Cap at 1.0
+    
+    def get_analytics(self) -> Dict[str, Any]:
+        """Get routing analytics"""
+        return self.analytics.get_routing_stats()
+
+# Complete production-ready setup with all LLM providers
+def create_production_router(provider: str = "openai") -> EnhancedAPIAgentRouter:
+    """Create production-ready router with specified LLM provider"""
+    
+    # API configuration
+    api_config = APIConfig(
+        sql_agent_url="http://localhost:8001/sql-agent",     # Your actual endpoints
+        tools_agent_url="http://localhost:8002/tools-agent",
+        timeout=30,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": "Bearer your-api-token"  # If needed
+        }
+    )
+    
+    # LLM configurations for different providers
+    llm_configs = {
+        "openai": {
+            "provider": "openai",
+            "model": "gpt-4-turbo-preview",  # Latest model
+            "api_key": "your-openai-api-key",  # Set from environment variable
+            "temperature": 0,
+            "max_tokens": 10
+        },
+        
+        "openai_fast": {
+            "provider": "openai", 
+            "model": "gpt-3.5-turbo",  # Faster and cheaper
+            "api_key": "your-openai-api-key",
+            "temperature": 0,
+            "max_tokens": 10
+        },
+        
+        "anthropic": {
+            "provider": "anthropic",
+            "model": "claude-3-sonnet-20240229",
+            "api_key": "your-anthropic-api-key",
+            "temperature": 0,
+            "max_tokens": 10
+        },
+        
+        "gemini": {
+            "provider": "gemini",
+            "model": "gemini-pro",  # or "gemini-1.5-pro" for latest
+            "api_key": "your-google-api-key",
+            "temperature": 0,
+            "max_tokens": 10
+        },
+        
+        "gemini_flash": {
+            "provider": "gemini",
+            "model": "gemini-1.5-flash",  # Faster and cheaper option
+            "api_key": "your-google-api-key", 
+            "temperature": 0,
+            "max_tokens": 10
+        },
+        
+        "local_ollama": {
+            "provider": "local",
+            "model": "llama2",  # or "mistral", "codellama"
+            "base_url": "http://localhost:11434/v1",
+            "temperature": 0,
+            "max_tokens": 10
+        },
+        
+        "local_lmstudio": {
+            "provider": "local",
+            "model": "any-local-model",
+            "base_url": "http://localhost:1234/v1",  # LM Studio default
+            "temperature": 0,
+            "max_tokens": 10
+        }
+    }
+    
+    if provider not in llm_configs:
+        raise ValueError(f"Unsupported provider: {provider}. Choose from {list(llm_configs.keys())}")
+    
+    return EnhancedAPIAgentRouter(api_config, llm_configs[provider])
+
+# Environment variable setup helper
+def setup_environment_variables():
+    """Helper to set up environment variables for API keys"""
+    import os
+    
+    required_vars = {
+        "OPENAI_API_KEY": "your-openai-api-key",
+        "ANTHROPIC_API_KEY": "your-anthropic-api-key",
+        "GOOGLE_API_KEY": "your-google-gemini-api-key",
+        "SQL_AGENT_URL": "http://localhost:8001/sql-agent",
+        "TOOLS_AGENT_URL": "http://localhost:8002/tools-agent",
+    }
+    
+    print("Environment Variable Setup:")
+    print("=" * 40)
+    
+    for var_name, example in required_vars.items():
+        current_value = os.getenv(var_name, "Not set")
+        print(f"{var_name}: {current_value}")
+        if current_value == "Not set":
+            print(f"  → Set with: export {var_name}={example}")
+    
+    print("\nExample .env file content:")
+    print("-" * 25)
+    for var_name, example in required_vars.items():
+        print(f"{var_name}={example}")
+
+# Complete usage example with all features
+if __name__ == "__main__":
+    # Setup environment check
+    print("Checking environment setup...")
+    setup_environment_variables()
+    print("\n" + "="*60 + "\n")
+    
+    # Create enhanced router (choose your provider)
+    try:
+        router = create_production_router("openai")  # or "anthropic", "local_ollama"
+        print("✅ Router initialized successfully")
+    except Exception as e:
+        print(f"❌ Router initialization failed: {e}")
+        print("Falling back to rule-based routing only...")
+        # Create basic router without LLM
+        api_config = APIConfig(
+            sql_agent_url="http://localhost:8001/sql-agent",
+            tools_agent_url="http://localhost:8002/tools-agent"
+        )
+        router = APIAgentRouter(api_config, llm_config={"provider": "none"})
+    
+    # Enhanced test queries
+    test_queries = [
+        # Clear SQL queries
+        "Show me all users in the database",
+        "Count total orders for this month", 
+        "Find customers with highest revenue",
+        "Generate sales report for Q4",
+        
+        # Clear system queries
+        "Get the server status for production",
+        "Execute health check on my-instance", 
+        "Deploy the latest version to staging",
+        "Backup database and upload to S3",
+        
+        # Ambiguous queries (where LLM shines)
+        "I need to analyze user behavior patterns",
+        "Can you help me troubleshoot the API issues?",
+        "Show me the performance metrics from yesterday",
+        "Process the pending batch jobs",
+        
+        # Edge cases
+        "What's the weather today?",
+        "Hello, how are you?",
+        ""
+    ]
+    
+    print("Testing Enhanced LLM-Based Router...")
+    print("=" * 60)
+    
+    for i, query in enumerate(test_queries, 1):
+        if not query.strip():
+            continue
+            
+        print(f"\n{i}. Query: '{query}'")
+        print("-" * 50)
+        
+        try:
+            # Use enhanced routing with confidence scoring
+            if hasattr(router, 'route_with_confidence'):
+                result = router.route_with_confidence(query)
+                
+                print(f"✅ Success: {result['success']}")
+                print(f"🤖 Agent: {result.get('agent_used', 'N/A')}")
+                print(f"🎯 Confidence: {result.get('confidence', 'N/A'):.2f}")
+                print(f"📊 Method: {result.get('routing_method', 'N/A')}")
+                print(f"🧠 LLM Decision: {result.get('llm_decision', 'N/A')}")
+                print(f"📋 Rule Decision: {result.get('rule_decision', 'N/A')}")
+                print(f"⏱️  Response Time: {result.get('response_time', 'N/A')}")
+                
+            else:
+                # Fallback to basic routing
+                result = router.route_and_call(query)
+                print(f"✅ Success: {result['success']}")
+                print(f"🤖 Agent: {result.get('agent_used', 'N/A')}")
+            
+        except Exception as e:
+            print(f"❌ Exception: {str(e)}")
+    
+    # Show analytics if available
+    if hasattr(router, 'get_analytics'):
+        print("\n" + "="*60)
+        print("ROUTING ANALYTICS")
+        print("="*60)
+        analytics = router.get_analytics()
+        for key, value in analytics.items():
+            print(f"{key}: {value}")
+
+# Async support for Gemini
+class AsyncEnhancedAPIAgentRouter(EnhancedAPIAgentRouter):
+    """Async version with Gemini support"""
+    
+    async def _call_llm_for_routing_async(self, prompt: str) -> str:
+        """Async LLM call for routing decision"""
+        
+        provider = self.llm_config.get("provider", "openai").lower()
+        model = self.llm_config.get("model", "gpt-4")
+        
+        if provider == "openai" or provider == "local":
+            import asyncio
+            # Use asyncio to run sync OpenAI calls
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(
+                None, 
+                lambda: self._routing_llm.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": "You are a precise query classifier."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=self.llm_config.get("temperature", 0),
+                    max_tokens=self.llm_config.get("max_tokens", 10)
+                )
+            )
+            return response.choices[0].message.content.strip().upper()
+            
+        elif provider == "anthropic":
+            import asyncio
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(
+                None,
+                lambda: self._routing_llm.messages.create(
+                    model=model,
+                    max_tokens=self.llm_config.get("max_tokens", 10),
+                    temperature=self.llm_config.get("temperature", 0),
+                    messages=[{"role": "user", "content": prompt}]
+                )
+            )
+            return response.content[0].text.strip().upper()
+        
+        elif provider == "gemini":
+            import asyncio
+            generation_config = {
+                "temperature": self.llm_config.get("temperature", 0),
+                "max_output_tokens": self.llm_config.get("max_tokens", 10),
+                "top_p": 0.1,
+                "top_k": 1
+            }
+            
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(
+                None,
+                lambda: self._routing_llm.generate_content(
+                    prompt,
+                    generation_config=generation_config
+                )
+            )
+            return response.text.strip().upper()
+        
+        else:
+            raise ValueError(f"Unsupported provider for async LLM call: {provider}")
+
+# Gemini-specific optimizations and prompts
+class GeminiOptimizedRouter(EnhancedAPIAgentRouter):
+    """Router optimized specifically for Google Gemini"""
+    
+    def _get_gemini_optimized_prompt(self, user_input: str) -> str:
+        """Gemini-optimized routing prompt"""
+        
+        return f"""Task: Classify the following user query into exactly one category.
+
+Categories:
+1. SQL_AGENT - For database queries, data analysis, business intelligence
+   • Keywords: select, database, users, customers, orders, count, sum, analytics
+   • Examples: "Show all users", "Count orders", "Sales report"
+
+2. TOOLS_AGENT - For system operations, API calls, infrastructure management  
+   • Keywords: server, instance, status, deploy, API, health, backup
+   • Examples: "Server status", "Deploy app", "API health check"
+
+User Query: "{user_input}"
+
+Instructions:
+- Analyze the query carefully
+- Consider the intent and context
+- Respond with ONLY: SQL_AGENT or TOOLS_AGENT or UNKNOWN
+- Do not include explanations
+
+Classification:"""
+    
+    def _llm_based_routing(self, user_input: str) -> AgentAPI:
+        """Gemini-optimized routing"""
+        
+        if self.llm_config.get("provider") == "gemini":
+            # Use Gemini-optimized prompt
+            routing_prompt = self._get_gemini_optimized_prompt(user_input)
+        else:
+            # Use standard prompt for other providers
+            routing_prompt = self._get_routing_prompt(user_input, style="detailed")
+        
+        try:
+            if not self._routing_llm:
+                self._routing_llm = self._initialize_llm()
+            
+            classification = self._call_llm_for_routing(routing_prompt)
+            
+            # Map response to enum
+            if "SQL_AGENT" in classification:
+                return AgentAPI.SQL_AGENT
+            elif "TOOLS_AGENT" in classification:
+                return AgentAPI.TOOLS_AGENT
+            else:
+                return AgentAPI.UNKNOWN
+                
+        except Exception as e:
+            print(f"LLM routing failed: {e}")
+            return AgentAPI.UNKNOWN
+
+# Installation and setup helper for Gemini
+def setup_gemini_requirements():
+    """Helper function to show Gemini setup requirements"""
+    
+    setup_info = """
+    GOOGLE GEMINI SETUP
+    ==================
+    
+    1. Install Google AI Python SDK:
+       pip install google-generativeai
+    
+    2. Get API Key:
+       - Go to: https://makersuite.google.com/app/apikey
+       - Create a new API key
+       - Set environment variable: GOOGLE_API_KEY=your-key
+    
+    3. Available Models:
+       - gemini-pro: Best accuracy, higher cost
+       - gemini-1.5-pro: Latest model with longer context
+       - gemini-1.5-flash: Faster and cheaper option
+    
+    4. Test your setup:
+       ```python
+       import google.generativeai as genai
+       genai.configure(api_key="your-api-key")
+       model = genai.GenerativeModel('gemini-pro')
+       response = model.generate_content("Hello")
+       print(response.text)
+       ```
+    
+    5. Pricing (as of 2024):
+       - gemini-pro: Free tier available, then pay-per-use
+       - gemini-1.5-flash: Optimized for speed and cost
+    """
+    
+    print(setup_info)
+    
+    # Check if Gemini is properly installed
+    try:
+        import google.generativeai as genai
+        print("✅ google-generativeai package is installed")
+        
+        import os
+        api_key = os.getenv("GOOGLE_API_KEY")
+        if api_key:
+            print("✅ GOOGLE_API_KEY environment variable is set")
+            
+            # Test connection
+            try:
+                genai.configure(api_key=api_key)
+                model = genai.GenerativeModel('gemini-pro')
+                response = model.generate_content("Test")
+                print("✅ Gemini API connection successful")
+            except Exception as e:
+                print(f"❌ Gemini API connection failed: {e}")
+        else:
+            print("❌ GOOGLE_API_KEY environment variable not set")
+            
+    except ImportError:
+        print("❌ google-generativeai package not installed")
+        print("   Run: pip install google-generativeai")
+
+# Complete Gemini example
+def create_gemini_router_example():
+    """Complete example using Gemini for routing"""
+    
+    import os
+    
+    # Check setup
+    if not os.getenv("GOOGLE_API_KEY"):
+        print("Please set GOOGLE_API_KEY environment variable")
+        return None
+    
+    # API configuration
+    api_config = APIConfig(
+        sql_agent_url=os.getenv("SQL_AGENT_URL", "http://localhost:8001/sql-agent"),
+        tools_agent_url=os.getenv("TOOLS_AGENT_URL", "http://localhost:8002/tools-agent"),
+        timeout=30
+    )
+    
+    # Gemini configuration
+    gemini_config = {
+        "provider": "gemini",
+        "model": "gemini-pro",  # or "gemini-1.5-flash" for speed
+        "api_key": os.getenv("GOOGLE_API_KEY"),
+        "temperature": 0,
+        "max_tokens": 10
+    }
+    
+    # Create optimized router
+    router = GeminiOptimizedRouter(api_config, gemini_config)
+    
+    print("🚀 Gemini Router initialized successfully!")
+    return router
+
+    # Try the router with enhanced routing
+    try:
+        router = create_gemini_router_example()
+        if router:
+            print("Testing Gemini router...")
+            
+            test_queries = [
+                "Show me all customers from the database",
+                "Check the health status of production server",
+                "Generate a monthly sales report",
+                "Deploy the latest version to staging environment"
+            ]
+            
+            for query in test_queries:
+                print(f"\nQuery: {query}")
+                result = router.route_with_confidence(query)
+                print(f"Agent: {result['agent_used']}")
+                print(f"Confidence: {result.get('confidence', 'N/A'):.2f}")
+                print(f"Method: {result.get('routing_method', 'N/A')}")
+    
+    except Exception as e:
+        print(f"Gemini router test failed: {e}")
+        print("Please check your setup and try again.")
+
+# Production-ready Flask app that works with your exposed APIs
+def create_production_flask_app():
+    """Production Flask app that integrates with your actual agent APIs"""
+    
+    app = Flask(__name__)
+    
+    # Configuration from environment variables (recommended for production)
+    import os
+    
+    api_config = APIConfig(
+        sql_agent_url=os.getenv("SQL_AGENT_URL", "http://localhost:8001/api/sql-query"),
+        tools_agent_url=os.getenv("TOOLS_AGENT_URL", "http://localhost:8002/api/tools-execute"),
+        timeout=int(os.getenv("API_TIMEOUT", "30")),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {os.getenv('API_TOKEN', '')}" if os.getenv('API_TOKEN') else {"Content-Type": "application/json"}
+        }
+    )
+    
+    # LLM configuration (choose your provider)
+    llm_config = {
+        "provider": os.getenv("LLM_PROVIDER", "gemini").lower(),
+        "model": os.getenv("LLM_MODEL", "gemini-pro"),
+        "api_key": os.getenv("GOOGLE_API_KEY") or os.getenv("OPENAI_API_KEY") or os.getenv("ANTHROPIC_API_KEY"),
+        "temperature": 0,
+        "max_tokens": 10
+    }
+    
+    # Initialize router
+    try:
+        if llm_config["provider"] == "gemini":
+            router = GeminiOptimizedRouter(api_config, llm_config)
+        else:
+            router = EnhancedAPIAgentRouter(api_config, llm_config)
+        app.logger.info(f"✅ Router initialized with {llm_config['provider']} LLM")
+    except Exception as e:
+        # Fallback to rule-based routing if LLM initialization fails
+        router = APIAgentRouter(api_config)
+        app.logger.warning(f"⚠️ LLM initialization failed, using rule-based routing: {e}")
+    
+    @app.route('/health', methods=['GET'])
+    def health():
+        """Health check endpoint"""
+        return jsonify({
+            "status": "healthy",
+            "router_type": type(router).__name__,
+            "llm_provider": llm_config.get("provider", "none"),
+            "agent_endpoints": {
+                "sql_agent": api_config.sql_agent_url,
+                "tools_agent": api_config.tools_agent_url
+            },
+            "timestamp": "2024-01-01T00:00:00Z"  # Replace with actual timestamp
+        })
+    
+    @app.route('/test-agents', methods=['GET'])
+    def test_agents():
+        """Test connectivity to both agent APIs"""
+        results = {}
+        
+        # Test SQL Agent API
+        try:
+            test_payload = {"query": "SELECT 1 as test", "test_mode": True}
+            response = requests.post(
+                api_config.sql_agent_url,
+                json=test_payload,
+                headers=api_config.headers,
+                timeout=5
+            )
+            results['sql_agent'] = {
+                "status": "✅ Connected",
+                "status_code": response.status_code,
+                "url": api_config.sql_agent_url
+            }
+        except Exception as e:
+            results['sql_agent'] = {
+                "status": "❌ Failed",
+                "error": str(e),
+                "url": api_config.sql_agent_url
+            }
+        
+        # Test Tools Agent API
+        try:
+            test_payload = {"query": "health check", "test_mode": True}
+            response = requests.post(
+                api_config.tools_agent_url,
+                json=test_payload,
+                headers=api_config.headers,
+                timeout=5
+            )
+            results['tools_agent'] = {
+                "status": "✅ Connected", 
+                "status_code": response.status_code,
+                "url": api_config.tools_agent_url
+            }
+        except Exception as e:
+            results['tools_agent'] = {
+                "status": "❌ Failed",
+                "error": str(e),
+                "url": api_config.tools_agent_url
+            }
+        
+        return jsonify(results)
+    
+    @app.route('/chat', methods=['POST'])
+    def chat():
+        """Main chat endpoint that routes to appropriate agent API"""
+        
+        try:
+            data = request.json
+            if not data:
+                return jsonify({"error": "No JSON data provided"}), 400
+            
+            user_input = data.get('message', '').strip()
+            user_context = data.get('context', {})
+            
+            if not user_input:
+                return jsonify({"error": "No message provided"}), 400
+            
+            # Log the request
+            app.logger.info(f"Chat request: {user_input}")
+            
+            # Route and call appropriate API
+            if hasattr(router, 'route_with_confidence'):
+                result = router.route_with_confidence(user_input, user_context)
+            else:
+                result = router.route_and_call(user_input, user_context)
+            
+            # Log the result
+            app.logger.info(f"Routed to: {result.get('agent_used', 'unknown')}")
+            
+            return jsonify(result)
+            
+        except requests.exceptions.RequestException as e:
+            error_msg = f"Agent API request failed: {str(e)}"
+            app.logger.error(error_msg)
+            return jsonify({
+                "success": False,
+                "error": error_msg,
+                "error_type": "api_request_failed"
+            }), 503
+            
+        except Exception as e:
+            error_msg = f"Unexpected error: {str(e)}"
+            app.logger.error(error_msg)
+            return jsonify({
+                "success": False,
+                "error": error_msg,
+                "error_type": "internal_error"
+            }), 500
+    
+    @app.route('/route-test', methods=['POST'])
+    def route_test():
+        """Test routing without calling actual APIs"""
+        
+        try:
+            data = request.json
+            query = data.get('query', '')
+            
+            if not query:
+                return jsonify({"error": "No query provided"}), 400
+            
+            # Test routing decision only
+            agent_decision = router._determine_agent(query)
+            
+            # Get routing explanations
+            routing_info = {
+                "query": query,
+                "routed_to": agent_decision.value,
+                "reasoning": router._get_routing_reason(agent_decision, query)
+            }
+            
+            # If enhanced router, get additional info
+            if hasattr(router, '_llm_based_routing'):
+                try:
+                    llm_decision = router._llm_based_routing(query)
+                    rule_decision = router._rule_based_routing(query)
+                    
+                    routing_info.update({
+                        "llm_decision": llm_decision.value,
+                        "rule_decision": rule_decision.value,
+                        "decisions_agree": llm_decision == rule_decision
+                    })
+                except Exception as e:
+                    routing_info["routing_error"] = str(e)
+            
+            return jsonify(routing_info)
+            
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route('/analytics', methods=['GET'])
+    def analytics():
+        """Get routing analytics if available"""
+        
+        if hasattr(router, 'get_analytics'):
+            return jsonify(router.get_analytics())
+        else:
+            return jsonify({"message": "Analytics not available for this router type"})
+    
+    # Error handlers
+    @app.errorhandler(404)
+    def not_found(error):
+        return jsonify({"error": "Endpoint not found"}), 404
+    
+    @app.errorhandler(500)
+    def internal_error(error):
+        return jsonify({"error": "Internal server error"}), 500
+    
+    return app
+
+# FastAPI version for production
+def create_production_fastapi_app():
+    """Production FastAPI app that integrates with your actual agent APIs"""
+    
+    from fastapi import FastAPI, HTTPException, BackgroundTasks
+    from fastapi.middleware.cors import CORSMiddleware
+    import asyncio
+    import aiohttp
+    import os
+    
+    app = FastAPI(
+        title="Multi-Agent Router API",
+        description="Routes queries to SQL Agent or Tools Agent APIs",
+        version="1.0.0"
+    )
+    
+    # Enable CORS
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],  # Configure appropriately for production
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    
+    # Configuration
+    api_config = APIConfig(
+        sql_agent_url=os.getenv("SQL_AGENT_URL", "http://localhost:8001/api/sql-query"),
+        tools_agent_url=os.getenv("TOOLS_AGENT_URL", "http://localhost:8002/api/tools-execute"),
+        timeout=int(os.getenv("API_TIMEOUT", "30")),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {os.getenv('API_TOKEN', '')}" if os.getenv('API_TOKEN') else {"Content-Type": "application/json"}
+        }
+    )
+    
+    llm_config = {
+        "provider": os.getenv("LLM_PROVIDER", "gemini").lower(),
+        "model": os.getenv("LLM_MODEL", "gemini-pro"),
+        "api_key": os.getenv("GOOGLE_API_KEY") or os.getenv("OPENAI_API_KEY") or os.getenv("ANTHROPIC_API_KEY"),
+        "temperature": 0,
+        "max_tokens": 10
+    }
+    
+    # Initialize router
+    try:
+        if llm_config["provider"] == "gemini":
+            router = GeminiOptimizedRouter(api_config, llm_config)
+        else:
+            router = EnhancedAPIAgentRouter(api_config, llm_config)
+        print(f"✅ Router initialized with {llm_config['provider']} LLM")
+    except Exception as e:
+        router = APIAgentRouter(api_config)
+        print(f"⚠️ LLM initialization failed, using rule-based routing: {e}")
+    
+    @app.get("/health")
+    async def health():
+        return {
+            "status": "healthy",
+            "router_type": type(router).__name__,
+            "llm_provider": llm_config.get("provider", "none"),
+            "agent_endpoints": {
+                "sql_agent": api_config.sql_agent_url,
+                "tools_agent": api_config.tools_agent_url
+            }
+        }
+    
+    @app.get("/test-agents")
+    async def test_agents():
+        """Async test of agent API connectivity"""
+        results = {}
+        
+        async with aiohttp.ClientSession() as session:
+            # Test SQL Agent
+            try:
+                test_payload = {"query": "SELECT 1 as test", "test_mode": True}
+                async with session.post(
+                    api_config.sql_agent_url,
+                    json=test_payload,
+                    headers=api_config.headers,
+                    timeout=aiohttp.ClientTimeout(total=5)
+                ) as response:
+                    results['sql_agent'] = {
+                        "status": "✅ Connected",
+                        "status_code": response.status,
+                        "url": api_config.sql_agent_url
+                    }
+            except Exception as e:
+                results['sql_agent'] = {
+                    "status": "❌ Failed",
+                    "error": str(e),
+                    "url": api_config.sql_agent_url
+                }
+            
+            # Test Tools Agent
+            try:
+                test_payload = {"query": "health check", "test_mode": True}
+                async with session.post(
+                    api_config.tools_agent_url,
+                    json=test_payload,
+                    headers=api_config.headers,
+                    timeout=aiohttp.ClientTimeout(total=5)
+                ) as response:
+                    results['tools_agent'] = {
+                        "status": "✅ Connected",
+                        "status_code": response.status,
+                        "url": api_config.tools_agent_url
+                    }
+            except Exception as e:
+                results['tools_agent'] = {
+                    "status": "❌ Failed",
+                    "error": str(e),
+                    "url": api_config.tools_agent_url
+                }
+        
+        return results
+    
+    @app.post("/chat")
+    async def chat(request: ChatRequest):
+        try:
+            if not request.message.strip():
+                raise HTTPException(status_code=400, detail="No message provided")
+            
+            # Route and call appropriate API
+            if hasattr(router, 'route_with_confidence'):
+                result = router.route_with_confidence(request.message, request.context)
+            else:
+                result = router.route_and_call(request.message, request.context)
+            
+            return result
+            
+        except requests.exceptions.RequestException as e:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Agent API request failed: {str(e)}"
+            )
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Unexpected error: {str(e)}"
+            )
+    
+    return app
+
+# Docker configuration for easy deployment
+def create_dockerfile():
+    """Generate Dockerfile for containerized deployment"""
+    
+    dockerfile_content = """
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application
+COPY . .
+
+# Environment variables (override in docker-compose or k8s)
+ENV SQL_AGENT_URL=http://sql-agent:8001/api/sql-query
+ENV TOOLS_AGENT_URL=http://tools-agent:8002/api/tools-execute
+ENV LLM_PROVIDER=gemini
+ENV LLM_MODEL=gemini-pro
+
+# Expose port
+EXPOSE 8000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+# Run the application
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+"""
+    
+    requirements_content = """
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+requests==2.31.0
+aiohttp==3.9.0
+google-generativeai==0.3.0
+openai==1.3.0
+anthropic==0.7.0
+python-multipart==0.0.6
+"""
+    
+    return dockerfile_content, requirements_content
+
+# Complete deployment example
+def deploy_production_setup():
+    """Complete production setup with all configurations"""
+    
+    print("🚀 PRODUCTION DEPLOYMENT SETUP")
+    print("=" * 50)
+    
+    # 1. Environment variables setup
+    env_template = """
+# API Configuration
+SQL_AGENT_URL=http://your-sql-agent:8001/api/sql-query
+TOOLS_AGENT_URL=http://your-tools-agent:8002/api/tools-execute
+API_TOKEN=your-api-token-if-needed
+API_TIMEOUT=30
+
+# LLM Configuration (choose one)
+LLM_PROVIDER=gemini
+LLM_MODEL=gemini-pro
+GOOGLE_API_KEY=your-google-api-key
+
+# Alternative LLM options:
+# LLM_PROVIDER=openai
+# OPENAI_API_KEY=your-openai-key
+# 
+# LLM_PROVIDER=anthropic  
+# ANTHROPIC_API_KEY=your-anthropic-key
+
+# Application Configuration
+PORT=8000
+DEBUG=false
+"""
+    
+    print("1. Create .env file with these variables:")
+    print(env_template)
+    
+    # 2. Docker setup
+    dockerfile, requirements = create_dockerfile()
+    print("\n2. Create Dockerfile:")
+    print(dockerfile[:200] + "...")
+    
+    # 3. Usage examples
+    print("\n3. Usage Examples:")
+    print("""
+# Test the router
+curl -X POST http://localhost:8000/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message": "Show me all users from the database"}'
+
+# Expected response:
+{
+  "success": true,
+  "agent_used": "sql_agent", 
+  "query": "Show me all users from the database",
+  "response": {
+    "status_code": 200,
+    "data": {...},
+    "api_endpoint": "http://your-sql-agent:8001/api/sql-query"
+  },
+  "confidence": 0.95,
+  "routing_method": "llm_high_confidence"
+}
+""")
+    
+    print("\n4. Health Check:")
+    print("curl http://localhost:8000/health")
+    
+    print("\n5. Test Agent Connectivity:")
+    print("curl http://localhost:8000/test-agents")
+    
+    print("\n✅ Setup complete! Your router will work with your exposed agent APIs.")
+
+if __name__ == "__main__":
+    # Run the deployment setup guide
+    deploy_production_setup()
+
+# FastAPI integration example
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+
+class ChatRequest(BaseModel):
+    message: str
+    context: Optional[Dict[str, Any]] = None
+
+def create_fastapi_app():
+    app = FastAPI(title="Multi-Agent Router API")
+    
+    config = APIConfig(
+        sql_agent_url="http://localhost:8001/sql-agent",
+        tools_agent_url="http://localhost:8002/tools-agent"
+    )
+    router = AsyncAPIAgentRouter(config)
+    
+    @app.post("/chat")
+    async def chat(request: ChatRequest):
+        try:
+            result = await router.route_and_call_async(request.message, request.context)
+            return result
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    @app.get("/health")
+    async def health():
+        return {
+            "status": "healthy",
+            "available_agents": ["sql_agent", "tools_agent"]
+        }
+    
+    return app
+
+# Usage examples with LLM-based routing
+if __name__ == "__main__":
+    # Configuration for your actual API endpoints
+    api_config = APIConfig(
+        sql_agent_url="http://localhost:8001/query",  # Replace with your actual endpoints
+        tools_agent_url="http://localhost:8002/execute",
+        timeout=30,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": "Bearer your-api-token"  # If needed
+        }
+    )
+    
+    # LLM configuration options
+    llm_configs = {
+        "openai": {
+            "provider": "openai",
+            "model": "gpt-4",  # or "gpt-3.5-turbo" for faster routing
+            "api_key": "your-openai-api-key",
+            "temperature": 0,
+            "max_tokens": 10
+        },
+        "anthropic": {
+            "provider": "anthropic", 
+            "model": "claude-3-sonnet-20240229",
+            "api_key": "your-anthropic-api-key",
+            "temperature": 0,
+            "max_tokens": 10
+        },
+        "local": {
+            "provider": "local",
+            "model": "llama2",  # or any local model
+            "base_url": "http://localhost:11434/v1",  # Ollama default
+            "temperature": 0,
+            "max_tokens": 10
+        }
+    }
+    
+    # Choose your LLM provider
+    router = APIAgentRouter(api_config, llm_configs["openai"])  # Change as needed
+    
+    # Test queries with LLM routing
+    test_queries = [
+        "Show me all users in the database",  # Should call SQL Agent API
+        "Get the server status for production",  # Should call Tools Agent API
+        "Count total orders for this month",  # Should call SQL Agent API
+        "Execute health check on my-instance",  # Should call Tools Agent API
+        "Find customers who purchased in the last 30 days",  # Should call SQL Agent API
+        "Deploy the latest version to staging environment",  # Should call Tools Agent API
+        "Generate a revenue report for Q4",  # Should call SQL Agent API
+        "Backup the database and upload to S3",  # Should call Tools Agent API
+        "What's the weather today?"  # Should return unknown response
+    ]
+    
+    print("Testing LLM-Based API Router...")
+    print("=" * 60)
+    
+    for query in test_queries:
+        print(f"\nQuery: {query}")
+        try:
+            result = router.route_and_call(query)
+            print(f"Success: {result['success']}")
+            print(f"Agent Used: {result.get('agent_used', 'N/A')}")
+            print(f"Routing Reason: {result.get('routing_reason', 'N/A')}")
+            
+            if result['success']:
+                api_response = result['response']
+                print(f"API Status: {api_response.get('status_code', 'N/A')}")
+                print(f"API Endpoint: {api_response.get('api_endpoint', 'N/A')}")
+            else:
+                print(f"Error: {result.get('error', 'Unknown error')}")
+                
+        except Exception as e:
+            print(f"Exception: {str(e)}")
+        
+        print("-" * 40)
+
+# Enhanced Flask app with LLM routing
+def create_enhanced_flask_app():
+    app = Flask(__name__)
+    
+    # LLM configuration
+    llm_config = {
+        "provider": "openai",
+        "model": "gpt-4",
+        "api_key": "your-openai-api-key",  # Set your actual API key
+        "temperature": 0
+    }
+    
+    # Initialize router with LLM support
+    config = APIConfig(
+        sql_agent_url="http://localhost:8001/sql-agent",
+        tools_agent_url="http://localhost:8002/tools-agent",
+        timeout=30,
+        headers={"Content-Type": "application/json"}
+    )
+    router = APIAgentRouter(config, llm_config)
+    
+    @app.route('/chat', methods=['POST'])
+    def chat():
+        try:
+            data = request.json
+            user_input = data.get('message', '').strip()
+            user_context = data.get('context', {})
+            use_llm_routing = data.get('use_llm', True)  # Allow disabling LLM routing
+            
+            if not user_input:
+                return jsonify({"error": "No message provided"}), 400
+            
+            # Route with LLM or fallback to rules
+            if use_llm_routing:
+                result = router.route_and_call(user_input, user_context)
+            else:
+                # Force rule-based routing
+                old_determine = router._determine_agent
+                router._determine_agent = lambda x: router._rule_based_routing(x)
+                result = router.route_and_call(user_input, user_context)
+                router._determine_agent = old_determine
+            
+            return jsonify(result)
+            
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route('/test-routing', methods=['POST'])
+    def test_routing():
+        """Test different routing approaches"""
+        try:
+            data = request.json
+            query = data.get('query', '')
+            
+            if not query:
+                return jsonify({"error": "No query provided"}), 400
+            
+            results = {}
+            
+            # Test LLM routing
+            try:
+                llm_result = router._llm_based_routing(query)
+                results['llm_routing'] = llm_result.value
+            except Exception as e:
+                results['llm_routing'] = f"Error: {str(e)}"
+            
+            # Test rule-based routing
+            try:
+                rule_result = router._rule_based_routing(query)
+                results['rule_routing'] = rule_result.value
+            except Exception as e:
+                results['rule_routing'] = f"Error: {str(e)}"
+            
+            # Test different prompt styles
+            for style in ['simple', 'detailed', 'few_shot']:
+                try:
+                    prompt = router._get_routing_prompt(query, style)
+                    results[f'{style}_prompt'] = prompt[:200] + "..." if len(prompt) > 200 else prompt
+                except Exception as e:
+                    results[f'{style}_prompt'] = f"Error: {str(e)}"
+            
+            return jsonify({
+                "query": query,
+                "routing_results": results
+            })
+            
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    
+    return app
+
+# Helper function for testing individual APIs
+def test_api_connectivity(config: APIConfig):
+    """Test if both APIs are reachable"""
+    
+    test_payload = {"query": "test connectivity", "test": True}
+    
+    print("Testing API Connectivity...")
+    
+    # Test SQL Agent API
+    try:
+        response = requests.post(
+            config.sql_agent_url,
+            json=test_payload,
+            headers=config.headers,
+            timeout=5
+        )
+        print(f"✅ SQL Agent API ({config.sql_agent_url}): Status {response.status_code}")
+    except Exception as e:
+        print(f"❌ SQL Agent API ({config.sql_agent_url}): {str(e)}")
+    
+    # Test Tools Agent API  
+    try:
+        response = requests.post(
+            config.tools_agent_url,
+            json=test_payload,
+            headers=config.headers,
+            timeout=5
+        )
+        print(f"✅ Tools Agent API ({config.tools_agent_url}): Status {response.status_code}")
+    except Exception as e:
+        print(f"❌ Tools Agent API ({config.tools_agent_url}): {str(e)}")        
+        
+        
+        
+  ###££££££££&&-&&#-#-£-£-      
+        
+        
         timeout=30,
         headers={"Content-Type": "application/json", "Authorization": "Bearer your-token"}
     )
