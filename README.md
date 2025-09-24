@@ -1,3 +1,523 @@
+xxxxxxxxxxxxx
+# SOLUTION FOR UI vs API TOOL EXECUTION INCONSISTENCY
+
+import json
+import logging
+from typing import Dict, Any, Optional
+from langchain.tools import tool
+from langchain.agents import AgentExecutor, create_tool_calling_agent
+from langchain.prompts import ChatPromptTemplate
+from langchain.chat_models import ChatOpenAI
+from langchain.schema import BaseMessage
+from flask import Flask, request, jsonify
+
+# PROBLEM DIAGNOSIS: Common causes of UI vs API inconsistency
+"""
+Common Reasons for UI/API Tool Execution Inconsistency:
+
+1. DIFFERENT AGENT INITIALIZATION
+   - UI and API using different agent creation methods
+   - Different prompts between UI and API
+   - Different LLM settings (temperature, model, etc.)
+
+2. DIFFERENT TOOL CONFIGURATIONS
+   - Tools defined differently in UI vs API
+   - Tool descriptions vary between implementations
+   - Missing tools in one implementation
+
+3. CONVERSATION CONTEXT ISSUES
+   - UI maintains conversation history differently
+   - Session state not shared between UI and API
+   - Context window differences
+
+4. LLM PROVIDER DIFFERENCES
+   - Different API keys or endpoints
+   - Rate limiting affecting one but not the other
+   - Model version differences
+
+5. ERROR HANDLING DIFFERENCES
+   - UI swallows errors that API shows
+   - Different timeout settings
+   - Parsing error handling varies
+"""
+
+# UNIFIED AGENT FACTORY - USE THIS FOR BOTH UI AND API
+class UnifiedAgentFactory:
+    """Creates consistent agents for both UI and API"""
+    
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.tools = self._initialize_tools()
+        self.llm = self._initialize_llm()
+        self.prompt = self._create_consistent_prompt()
+        
+    def _initialize_tools(self):
+        """Initialize tools consistently"""
+        return [smart_sql_database_query]  # Your actual tools here
+    
+    def _initialize_llm(self):
+        """Initialize LLM with consistent settings"""
+        return ChatOpenAI(
+            model=self.config.get("model", "gpt-4"),
+            temperature=self.config.get("temperature", 0),
+            api_key=self.config.get("api_key"),
+            max_tokens=self.config.get("max_tokens", 2000),
+            timeout=self.config.get("timeout", 30)
+        )
+    
+    def _create_consistent_prompt(self):
+        """Create consistent prompt for both UI and API"""
+        
+        system_message = """You are an AutoSys database assistant. You MUST follow these rules:
+
+🚫 CRITICAL - NEVER RESPOND WITHOUT CALLING TOOLS:
+1. For ANY user question, you MUST call the smart_sql_database_query tool first
+2. NEVER provide direct answers without using tools
+3. NEVER say "I don't have access" without calling tools
+4. ALWAYS wait for tool results before responding
+
+✅ MANDATORY PROCESS:
+1. User asks anything → Call smart_sql_database_query tool
+2. Wait for tool response
+3. Format the tool response for the user
+4. If tool fails, report the failure clearly
+
+🔧 Available tools: {tools}
+
+Remember: TOOL USAGE IS MANDATORY for ALL queries."""
+
+        return ChatPromptTemplate.from_messages([
+            ("system", system_message),
+            ("user", "{input}"),
+            ("placeholder", "{agent_scratchpad}"),
+        ])
+    
+    def create_agent(self) -> AgentExecutor:
+        """Create agent with forced tool execution"""
+        
+        # Create base agent
+        agent = create_tool_calling_agent(
+            self.llm, 
+            self.tools, 
+            self.prompt
+        )
+        
+        # Create executor with consistent settings
+        agent_executor = AgentExecutor(
+            agent=agent,
+            tools=self.tools,
+            verbose=self.config.get("verbose", True),
+            return_intermediate_steps=True,
+            handle_parsing_errors=True,
+            max_iterations=self.config.get("max_iterations", 3),
+            early_stopping_method="generate"
+        )
+        
+        return agent_executor
+
+# CONSISTENT EXECUTION WRAPPER
+class ConsistentAgentWrapper:
+    """Wrapper that ensures consistent behavior across UI and API"""
+    
+    def __init__(self, agent_executor: AgentExecutor):
+        self.agent_executor = agent_executor
+        self.execution_log = []
+    
+    def execute(self, user_input: str, context: Dict = None) -> Dict[str, Any]:
+        """Execute with consistent validation and logging"""
+        
+        execution_id = len(self.execution_log)
+        log_entry = {
+            "id": execution_id,
+            "input": user_input,
+            "context": context or {},
+            "timestamp": "2024-01-01T00:00:00Z",  # Replace with actual timestamp
+            "tools_called": [],
+            "success": False,
+            "output": None,
+            "error": None
+        }
+        
+        try:
+            logging.info(f"🚀 Execution {execution_id}: {user_input}")
+            
+            # Execute agent
+            result = self.agent_executor.invoke({"input": user_input})
+            
+            # Extract tool usage information
+            intermediate_steps = result.get("intermediate_steps", [])
+            tools_called = [step[0].tool for step in intermediate_steps]
+            
+            log_entry.update({
+                "tools_called": tools_called,
+                "success": True,
+                "output": result.get("output"),
+                "intermediate_steps": len(intermediate_steps)
+            })
+            
+            # Validate tool execution
+            validation_result = self._validate_tool_execution(user_input, result)
+            
+            # Log and store
+            self.execution_log.append(log_entry)
+            
+            return {
+                "success": True,
+                "output": result.get("output"),
+                "tools_called": tools_called,
+                "validation": validation_result,
+                "execution_id": execution_id,
+                "debug_info": {
+                    "intermediate_steps": len(intermediate_steps),
+                    "agent_type": type(self.agent_executor.agent).__name__
+                }
+            }
+            
+        except Exception as e:
+            error_msg = str(e)
+            logging.error(f"❌ Execution {execution_id} failed: {error_msg}")
+            
+            log_entry.update({
+                "success": False,
+                "error": error_msg
+            })
+            self.execution_log.append(log_entry)
+            
+            return {
+                "success": False,
+                "error": error_msg,
+                "execution_id": execution_id,
+                "fallback_result": self._emergency_tool_call(user_input)
+            }
+    
+    def _validate_tool_execution(self, user_input: str, result: Dict) -> Dict:
+        """Validate that tools were called appropriately"""
+        
+        intermediate_steps = result.get("intermediate_steps", [])
+        tools_called_count = len(intermediate_steps)
+        
+        validation = {
+            "should_call_tools": self._should_call_tools(user_input),
+            "tools_called_count": tools_called_count,
+            "validation_status": "unknown"
+        }
+        
+        if validation["should_call_tools"] and tools_called_count == 0:
+            validation["validation_status"] = "FAILED - No tools called when required"
+        elif tools_called_count > 0:
+            validation["validation_status"] = "PASSED - Tools were called"
+        else:
+            validation["validation_status"] = "UNCLEAR - Review needed"
+        
+        return validation
+    
+    def _should_call_tools(self, user_input: str) -> bool:
+        """Determine if tools should be called for this input"""
+        
+        # For AutoSys queries, almost everything should call tools
+        tool_required_patterns = [
+            r'\b(job|status|instance|database|select|show|count|find|get|what|how)\b',
+            r'\b(da3|db3|dc3|dg3|ls3)\b',
+            r'\b(running|failed|success|pending)\b'
+        ]
+        
+        import re
+        user_lower = user_input.lower()
+        
+        return any(re.search(pattern, user_lower) for pattern in tool_required_patterns)
+    
+    def _emergency_tool_call(self, user_input: str) -> str:
+        """Emergency direct tool call if agent fails"""
+        try:
+            return smart_sql_database_query(user_input)
+        except Exception as e:
+            return f"Emergency tool call failed: {str(e)}"
+    
+    def get_execution_stats(self) -> Dict:
+        """Get execution statistics"""
+        total_executions = len(self.execution_log)
+        successful_executions = sum(1 for log in self.execution_log if log["success"])
+        tools_called_executions = sum(1 for log in self.execution_log if log["tools_called"])
+        
+        return {
+            "total_executions": total_executions,
+            "successful_executions": successful_executions, 
+            "success_rate": f"{(successful_executions/total_executions)*100:.1f}%" if total_executions > 0 else "N/A",
+            "tool_usage_rate": f"{(tools_called_executions/total_executions)*100:.1f}%" if total_executions > 0 else "N/A"
+        }
+
+# FLASK API WITH CONSISTENT AGENT
+def create_consistent_api():
+    """Create API that uses the same agent as UI"""
+    
+    app = Flask(__name__)
+    
+    # Shared configuration
+    config = {
+        "model": "gpt-4",
+        "temperature": 0,
+        "api_key": "your-openai-api-key",
+        "max_tokens": 2000,
+        "timeout": 30,
+        "verbose": True,
+        "max_iterations": 3
+    }
+    
+    # Create consistent agent
+    factory = UnifiedAgentFactory(config)
+    agent_executor = factory.create_agent()
+    agent_wrapper = ConsistentAgentWrapper(agent_executor)
+    
+    @app.route('/chat', methods=['POST'])
+    def api_chat():
+        """API endpoint with consistent agent behavior"""
+        
+        try:
+            data = request.json
+            user_input = data.get('message', '').strip()
+            context = data.get('context', {})
+            
+            if not user_input:
+                return jsonify({"error": "No message provided"}), 400
+            
+            # Execute with consistent wrapper
+            result = agent_wrapper.execute(user_input, context)
+            
+            # Add API-specific metadata
+            result.update({
+                "source": "api",
+                "timestamp": "2024-01-01T00:00:00Z",
+                "config": {
+                    "model": config["model"],
+                    "temperature": config["temperature"]
+                }
+            })
+            
+            return jsonify(result)
+            
+        except Exception as e:
+            return jsonify({
+                "success": False,
+                "error": str(e),
+                "source": "api",
+                "fallback_available": True
+            }), 500
+    
+    @app.route('/debug', methods=['GET'])
+    def debug_info():
+        """Debug endpoint to check agent status"""
+        
+        return jsonify({
+            "agent_type": type(agent_executor.agent).__name__,
+            "tools_available": [tool.name for tool in agent_executor.tools],
+            "execution_stats": agent_wrapper.get_execution_stats(),
+            "config": config
+        })
+    
+    return app, agent_wrapper
+
+# UI INTEGRATION CLASS
+class ConsistentUIIntegration:
+    """Integration class for UI that matches API behavior"""
+    
+    def __init__(self, config: Dict = None):
+        # Use the SAME configuration as API
+        self.config = config or {
+            "model": "gpt-4",
+            "temperature": 0,
+            "api_key": "your-openai-api-key",
+            "max_tokens": 2000,
+            "timeout": 30,
+            "verbose": True,
+            "max_iterations": 3
+        }
+        
+        # Create the SAME agent as API
+        factory = UnifiedAgentFactory(self.config)
+        agent_executor = factory.create_agent()
+        self.agent_wrapper = ConsistentAgentWrapper(agent_executor)
+    
+    def process_ui_message(self, user_input: str, conversation_history: list = None) -> Dict:
+        """Process UI message with same logic as API"""
+        
+        # Add conversation context if available
+        context = {}
+        if conversation_history:
+            context["conversation_history"] = conversation_history[-5:]  # Last 5 messages
+        
+        # Execute with same wrapper as API
+        result = self.agent_wrapper.execute(user_input, context)
+        
+        # Add UI-specific metadata
+        result.update({
+            "source": "ui",
+            "timestamp": "2024-01-01T00:00:00Z",
+            "config": self.config
+        })
+        
+        return result
+    
+    def get_debug_info(self) -> Dict:
+        """Get debug information for UI"""
+        return {
+            "source": "ui",
+            "execution_stats": self.agent_wrapper.get_execution_stats(),
+            "config": self.config
+        }
+
+# STREAMLIT UI EXAMPLE
+def create_consistent_streamlit_ui():
+    """Create Streamlit UI that behaves consistently with API"""
+    
+    import streamlit as st
+    
+    st.title("Consistent AutoSys Assistant")
+    
+    # Initialize UI integration
+    if 'ui_agent' not in st.session_state:
+        st.session_state.ui_agent = ConsistentUIIntegration()
+        st.session_state.messages = []
+    
+    # Display chat messages
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.write(message["content"])
+            if "debug_info" in message:
+                with st.expander("Debug Info"):
+                    st.json(message["debug_info"])
+    
+    # Chat input
+    if prompt := st.chat_input("Ask about AutoSys..."):
+        # Display user message
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.write(prompt)
+        
+        # Process with consistent agent
+        with st.chat_message("assistant"):
+            with st.spinner("Processing..."):
+                result = st.session_state.ui_agent.process_ui_message(
+                    prompt, 
+                    st.session_state.messages
+                )
+                
+                if result["success"]:
+                    st.write(result["output"])
+                    
+                    # Show tool usage info
+                    if result.get("tools_called"):
+                        st.info(f"🔧 Tools used: {', '.join(result['tools_called'])}")
+                    
+                    # Add to messages
+                    st.session_state.messages.append({
+                        "role": "assistant", 
+                        "content": result["output"],
+                        "debug_info": result.get("debug_info", {})
+                    })
+                else:
+                    st.error(f"Error: {result.get('error', 'Unknown error')}")
+                    
+                    # Show fallback result if available
+                    if result.get("fallback_result"):
+                        st.info("Fallback result:")
+                        st.write(result["fallback_result"])
+    
+    # Debug sidebar
+    with st.sidebar:
+        st.header("Debug Information")
+        if st.button("Show Debug Info"):
+            debug_info = st.session_state.ui_agent.get_debug_info()
+            st.json(debug_info)
+
+# TESTING FRAMEWORK
+def test_ui_api_consistency():
+    """Test that UI and API behave consistently"""
+    
+    print("🧪 TESTING UI vs API CONSISTENCY")
+    print("=" * 50)
+    
+    # Create both UI and API agents
+    config = {
+        "model": "gpt-4",
+        "temperature": 0,
+        "api_key": "your-openai-api-key",
+        "verbose": True
+    }
+    
+    ui_integration = ConsistentUIIntegration(config)
+    app, api_wrapper = create_consistent_api()
+    
+    test_queries = [
+        "What is the status of job123?",
+        "DA3 SELECT * FROM jobs",
+        "Show me running jobs on DB3",
+        "What is AutoSys?"
+    ]
+    
+    for query in test_queries:
+        print(f"\nTesting: '{query}'")
+        print("-" * 30)
+        
+        # Test UI
+        ui_result = ui_integration.process_ui_message(query)
+        print(f"UI Tools Called: {ui_result.get('tools_called', [])}")
+        print(f"UI Success: {ui_result.get('success')}")
+        
+        # Test API (simulated)
+        api_result = api_wrapper.execute(query)
+        print(f"API Tools Called: {api_result.get('tools_called', [])}")
+        print(f"API Success: {api_result.get('success')}")
+        
+        # Compare consistency
+        ui_tools = set(ui_result.get('tools_called', []))
+        api_tools = set(api_result.get('tools_called', []))
+        
+        if ui_tools == api_tools and ui_result.get('success') == api_result.get('success'):
+            print("✅ CONSISTENT")
+        else:
+            print("❌ INCONSISTENT")
+            print(f"   UI tools: {ui_tools}")
+            print(f"   API tools: {api_tools}")
+
+if __name__ == "__main__":
+    # Test consistency
+    test_ui_api_consistency()
+    
+    print("\n" + "=" * 60)
+    print("🎯 SOLUTION SUMMARY")
+    print("=" * 60)
+    
+    print("""
+✅ ROOT CAUSES ADDRESSED:
+1. Unified agent factory for both UI and API
+2. Consistent prompts and configurations
+3. Validation and logging for both environments
+4. Emergency fallback mechanisms
+5. Debug information for troubleshooting
+
+✅ IMPLEMENTATION:
+1. Replace UI agent with ConsistentUIIntegration
+2. Replace API agent with create_consistent_api()
+3. Use the same configuration for both
+4. Monitor execution with debug endpoints
+
+✅ GUARANTEED CONSISTENCY:
+- Same LLM settings
+- Same prompts
+- Same tools
+- Same validation logic
+- Same error handling
+""")
+    
+    print("\n🔧 NEXT STEPS:")
+    print("1. Replace your UI agent creation with ConsistentUIIntegration")
+    print("2. Replace your API agent creation with create_consistent_api()") 
+    print("3. Use the same configuration dictionary for both")
+    print("4. Test with the provided test_ui_api_consistency() function")
+    print("5. Monitor with debug endpoints to ensure consistency")
+mmmmmmmmmm
+
+
 zzzzzzzz
 
 # LLM-BASED INSTANCE NAME EXTRACTION AND AUTO-PASSING SYSTEM
