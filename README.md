@@ -1,4 +1,771 @@
 
+**********
+
+# FIXED ROUTER WITH PROPER TOOL CALLING
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import Dict, Any, Optional
+from enum import Enum
+import requests
+import json
+import logging
+from contextlib import asynccontextmanager
+
+# Your existing classes
+class AgentAPI(Enum):
+    JIL_AGENT = "jil_agent"
+    JOB_AGENT = "job_agent"
+    UNKNOWN = "unknown"
+
+class ChatRequest(BaseModel):
+    message: str
+    session_id: str
+    context: Optional[Dict[str, Any]] = # CREATE ROUTER WITH YOUR get_llm FUNCTION
+def create_router_with_your_llm(get_llm_function):
+    """Create router using your existing get_llm function"""
+    
+    # Configuration
+    config = APIConfig(
+        jil_agent_url="http://localhost:8081/chat-atsys",
+        job_agent_url="http://localhost:8080/chat"
+    )
+    
+    # Option 1: Use ToolBasedRouter with Gemini
+    gemini_config = {
+        "framework": "langchain", 
+        "model": "gemini-1.5-pro-002",
+        "temperature": 0.1,
+        "top_p": 1
+    }
+    
+    router = ToolBasedRouter(config, gemini_config)
+    
+    # Option 2: Use GeminiOptimizedRouter
+    # router = GeminiOptimizedRouter(config, gemini_config)
+    
+    # Option 3: Use custom router with your get_llm function
+    # CustomRouter = integrate_with_existing_get_llm(get_llm_function)
+    # router = CustomRouter(config)
+    
+    return router
+
+# TESTING YOUR GEMINI ROUTER
+def test_gemini_router(get_llm_function):
+    """Test the Gemini router with actual tool calls"""
+    
+    print("🧪 TESTING GEMINI ROUTER")
+    print("=" * 50)
+    
+    router = create_router_with_your_llm(get_llm_function)
+    
+    test_queries = [
+        ("how to onboard a new application in autosys", "Should call JIL agent"),
+        ("what is the connection profile for DA3", "Should call JIL agent"),
+        ("list all the jobs starting with ATSYS in DA3", "Should call JOB agent"),
+        ("show job failures in last 24 hours", "Should call JOB agent"),
+        ("provide next start time of the job", "Should call JOB agent")
+    ]
+    
+    for query, expected in test_queries:
+        print(f"\nQuery: '{query}'")
+        print(f"Expected: {expected}")
+        
+        try:
+            result = router.route_and_call(query, "test_session")
+            print(f"Success: {result['success']}")
+            print(f"Tools Used: {result.get('tools_used', [])}")
+            print(f"LLM Model: {result.get('llm_model', 'Unknown')}")
+            print(f"Response: {result.
+
+class APIConfig:
+    def __init__(self, jil_agent_url: str, job_agent_url: str, timeout: int = 30):
+        self.jil_agent_url = jil_agent_url
+        self.job_agent_url = job_agent_url
+        self.timeout = timeout
+        self.headers = {"Content-Type": "application/json"}
+
+# SOLUTION 1: Replace DummyLLM with Real LLM Tool Calling
+from langchain.chat_models import ChatOpenAI
+from langchain.tools import tool
+from langchain.agents import AgentExecutor, create_tool_calling_agent
+from langchain.prompts import ChatPromptTemplate
+
+class ToolBasedRouter:
+    """Router that uses actual LLM tools instead of string classification"""
+    
+    def __init__(self, config: APIConfig, llm_config: Dict = None):
+        self.config = config
+        self.llm_config = llm_config or {
+            "framework": "langchain",
+            "model": "gemini-1.5-pro-002",
+            "temperature": 0.1,
+            "top_p": 1
+        }
+        
+        # Initialize Gemini LLM using your function
+        self.llm = self._get_llm(
+            self.llm_config["framework"],
+            self.llm_config["model"],
+            self.llm_config["temperature"],
+            self.llm_config["top_p"]
+        )
+        
+        # Create tools for each agent
+        self.tools = [
+            self._create_jil_agent_tool(),
+            self._create_job_agent_tool()
+        ]
+        
+        # Create agent with tools
+        self.agent = self._create_routing_agent()
+    
+    def _get_llm(self, framework, model="gemini-1.5-pro-002", temperature=0.1, top_p=1):
+        """Initialize Gemini LLM - use your existing function"""
+        
+        if framework == "langchain":
+            from langchain_google_genai import ChatGoogleGenerativeAI
+            
+            return ChatGoogleGenerativeAI(
+                model=model,
+                temperature=temperature,
+                top_p=top_p,
+                google_api_key="your-google-api-key"  # Set your Gemini API key
+            )
+        else:
+            # If you have other framework implementations, add them here
+            raise ValueError(f"Unsupported framework: {framework}")
+        
+        # Or if you already have your get_llm function, you can use it directly:
+        # return get_llm(framework, model, temperature, top_p)
+    
+    def _create_jil_agent_tool(self):
+        """Create tool that calls JIL agent API"""
+        
+        @tool
+        def call_jil_agent(query: str) -> str:
+            """
+            Call JIL Agent for queries about JIL, Confluence, Autoping, Connection Profile, 
+            onboarding, how-to guides, and general system usage.
+            
+            Use for:
+            - How to onboard applications
+            - Connection profiles
+            - JIL configuration
+            - System setup guides
+            - General AutoSys questions
+            
+            Args:
+                query: User's question about JIL/system configuration
+            """
+            try:
+                payload = {"message": query, "session_id": "router_session"}
+                response = requests.post(
+                    self.config.jil_agent_url,
+                    json=payload,
+                    headers=self.config.headers,
+                    timeout=self.config.timeout
+                )
+                response.raise_for_status()
+                
+                result = response.json()
+                return f"JIL Agent Response: {result.get('data', result)}"
+                
+            except Exception as e:
+                return f"JIL Agent Error: {str(e)}"
+        
+        return call_jil_agent
+    
+    def _create_job_agent_tool(self):
+        """Create tool that calls JOB agent API"""
+        
+        @tool  
+        def call_job_agent(query: str) -> str:
+            """
+            Call Job Agent for queries about job status, job names, job failures, 
+            calendars, next start time, and job-related troubleshooting.
+            
+            Use for:
+            - Job status queries
+            - Job failures and errors
+            - Schedule and calendar information
+            - Job execution details
+            - Performance monitoring
+            
+            Args:
+                query: User's question about jobs and scheduling
+            """
+            try:
+                payload = {"message": query, "session_id": "router_session"}
+                response = requests.post(
+                    self.config.job_agent_url,
+                    json=payload,
+                    headers=self.config.headers,
+                    timeout=self.config.timeout
+                )
+                response.raise_for_status()
+                
+                result = response.json()
+                return f"Job Agent Response: {result.get('data', result)}"
+                
+            except Exception as e:
+                return f"Job Agent Error: {str(e)}"
+        
+        return call_job_agent
+    
+    def _create_routing_agent(self):
+        """Create agent that uses tools for routing"""
+        
+        system_prompt = """You are an intelligent AutoSys router. You have access to two specialized agents:
+
+1. JIL AGENT (call_jil_agent): For JIL, Confluence, Autoping, Connection Profile, onboarding, how-to guides, and general system usage
+2. JOB AGENT (call_job_agent): For job status, job names, job failures, calendars, next start time, and job-related troubleshooting
+
+MANDATORY RULES:
+- You MUST use one of the available tools for every user query
+- NEVER provide direct answers without calling a tool
+- Choose the most appropriate tool based on the query content
+- If unsure, prefer the JOB agent for job-related queries
+
+Examples of routing:
+- "how to onboard a new application in autosys" → call_jil_agent
+- "what is the connection profile for DA3" → call_jil_agent  
+- "list all the jobs starting with ATSYS in DA3" → call_job_agent
+- "show job failures in last 24 hours" → call_job_agent
+- "provide next start time of the job" → call_job_agent
+
+Always call the appropriate tool first, then provide the response."""
+
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", system_prompt),
+            ("user", "{input}"),
+            ("placeholder", "{agent_scratchpad}"),
+        ])
+        
+        # Create tool-calling agent
+        agent = create_tool_calling_agent(self.llm, self.tools, prompt)
+        
+        # Create executor
+        agent_executor = AgentExecutor(
+            agent=agent,
+            tools=self.tools,
+            verbose=True,
+            return_intermediate_steps=True,
+            handle_parsing_errors=True,
+            max_iterations=3
+        )
+        
+        return agent_executor
+    
+    def route_and_call(self, query: str, session_id: str, context: Dict = None) -> Dict[str, Any]:
+        """Route query and call appropriate agent using tools"""
+        
+        try:
+            logging.info(f"Routing query: {query}")
+            
+            # Execute agent with tools
+            result = self.agent.invoke({"input": query})
+            
+            # Extract tool usage information
+            intermediate_steps = result.get("intermediate_steps", [])
+            tools_used = [step[0].tool for step in intermediate_steps]
+            
+            logging.info(f"Tools used: {tools_used}")
+            
+            return {
+                "success": True,
+                "response": result["output"],
+                "tools_used": tools_used,
+                "agent_type": "tool_based_router",
+                "session_id": session_id
+            }
+            
+        except Exception as e:
+            logging.error(f"Router error: {str(e)}")
+            return {
+                "success": False,
+                "error": str(e),
+                "agent_type": "tool_based_router",
+                "session_id": session_id
+            }
+
+# SOLUTION 2: Alternative - Direct Tool Selection Router
+class DirectToolRouter:
+    """Simpler router that directly selects and calls tools"""
+    
+    def __init__(self, config: APIConfig):
+        self.config = config
+        self.jil_tool = self._create_jil_tool()
+        self.job_tool = self._create_job_tool()
+    
+    def _create_jil_tool(self):
+        def call_jil_api(query: str) -> Dict[str, Any]:
+            try:
+                payload = {"message": query, "session_id": "direct_router"}
+                response = requests.post(
+                    self.config.jil_agent_url,
+                    json=payload,
+                    headers=self.config.headers,
+                    timeout=self.config.timeout
+                )
+                response.raise_for_status()
+                return {"success": True, "data": response.json()}
+            except Exception as e:
+                return {"success": False, "error": str(e)}
+        
+        return call_jil_api
+    
+    def _create_job_tool(self):
+        def call_job_api(query: str) -> Dict[str, Any]:
+            try:
+                payload = {"message": query, "session_id": "direct_router"}
+                response = requests.post(
+                    self.config.job_agent_url,
+                    json=payload,
+                    headers=self.config.headers,
+                    timeout=self.config.timeout
+                )
+                response.raise_for_status()
+                return {"success": True, "data": response.json()}
+            except Exception as e:
+                return {"success": False, "error": str(e)}
+        
+        return call_job_api
+    
+    def route_and_call(self, query: str, session_id: str, context: Dict = None) -> Dict[str, Any]:
+        """Route using simple keyword detection and call tools directly"""
+        
+        query_lower = query.lower()
+        
+        # Job-related keywords
+        job_keywords = [
+            'job', 'status', 'failure', 'calendar', 'schedule', 'start time',
+            'running', 'failed', 'success', 'da3', 'db3', 'dc3', 'execution'
+        ]
+        
+        # JIL-related keywords  
+        jil_keywords = [
+            'onboard', 'connection profile', 'confluence', 'autoping',
+            'how to', 'setup', 'configure', 'jil', 'guide'
+        ]
+        
+        # Determine which tool to use
+        job_score = sum(1 for keyword in job_keywords if keyword in query_lower)
+        jil_score = sum(1 for keyword in jil_keywords if keyword in query_lower)
+        
+        if job_score > jil_score:
+            # Call job agent
+            result = self.job_tool(query)
+            agent_used = "job_agent"
+        else:
+            # Call jil agent (default)
+            result = self.jil_tool(query)
+            agent_used = "jil_agent"
+        
+        return {
+            "success": result["success"],
+            "response": result.get("data", result.get("error")),
+            "agent_used": agent_used,
+            "tools_used": [agent_used],
+            "routing_scores": {"job_score": job_score, "jil_score": jil_score},
+            "session_id": session_id
+        }
+
+# UPDATED FASTAPI APP
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    logger.info("Starting LLM Router API...")
+    
+    # Test agent connectivity
+    for name, url in {"jil_agent": config.jil_agent_url, "job_agent": config.job_agent_url}.items():
+        try:
+            response = requests.post(url, json={"message": "ping", "test_mode": True}, timeout=5)
+            logger.info(f"✅ {name} connectivity: OK")
+        except Exception as e:
+            logger.warning(f"⚠️ {name} connectivity: {e}")
+    
+    yield
+    # Shutdown
+    logger.info("Shutting down LLM Router API...")
+
+# Configuration with Gemini settings
+config = APIConfig(
+    jil_agent_url="http://localhost:8081/chat-atsys",  # Your JIL agent URL
+    job_agent_url="http://localhost:8080/chat"        # Your Job agent URL
+)
+
+# Gemini LLM configuration
+gemini_config = {
+    "framework": "langchain",
+    "model": "gemini-1.5-pro-002",  # or "gemini-pro", "gemini-1.5-flash" 
+    "temperature": 0.1,
+    "top_p": 1
+}
+
+# Create router with Gemini
+router = ToolBasedRouter(config, gemini_config)
+
+# Alternative: Direct tool router with Gemini
+# router = DirectToolRouter(config)
+
+app = FastAPI(title="LLM Router API", lifespan=lifespan)
+
+@app.post("/chat-atsys-route")
+def chat(request: ChatRequest):
+    if not request.message.strip():
+        raise HTTPException(status_code=400, detail="No message provided")
+    
+    try:
+        result = router.route_and_call(request.message, request.session_id, request.context)
+        return result
+        
+    except Exception as e:
+        logger.error(f"Chat endpoint error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/health")
+def health():
+    return {
+        "status": "healthy",
+        "agents": ["jil_agent", "job_agent"],
+        "router_type": type(router).__name__
+    }
+
+@app.get("/test-agents")
+def test_agents():
+    """Test connectivity to both agents"""
+    results = {}
+    
+    for name, url in {"jil_agent": config.jil_agent_url, "job_agent": config.job_agent_url}.items():
+        try:
+            response = requests.post(
+                url, 
+                json={"message": "ping", "session_id": "test"}, 
+                headers=config.headers,
+                timeout=5
+            )
+            results[name] = {
+                "status": "✅ Connected",
+                "status_code": response.status_code,
+                "url": url
+            }
+        except Exception as e:
+            results[name] = {
+                "status": "❌ Failed", 
+                "error": str(e),
+                "url": url
+            }
+    
+    return results
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="localhost", port=8090)
+
+# GEMINI-SPECIFIC OPTIMIZATIONS
+class GeminiOptimizedRouter:
+    """Router specifically optimized for Gemini LLM"""
+    
+    def __init__(self, config: APIConfig, gemini_config: Dict = None):
+        self.config = config
+        self.gemini_config = gemini_config or {
+            "model": "gemini-1.5-pro-002",
+            "temperature": 0.1,
+            "top_p": 1
+        }
+        
+        # Initialize Gemini
+        self.llm = self._initialize_gemini()
+        
+        # Create tools
+        self.jil_tool = self._create_jil_tool()
+        self.job_tool = self._create_job_tool()
+    
+    def _initialize_gemini(self):
+        """Initialize Gemini with optimal settings for tool calling"""
+        
+        try:
+            import google.generativeai as genai
+            
+            # Configure Gemini
+            genai.configure(api_key="your-google-api-key")  # Set your API key
+            
+            # Generation config optimized for tool calling
+            generation_config = {
+                "temperature": self.gemini_config["temperature"],
+                "top_p": self.gemini_config["top_p"],
+                "max_output_tokens": 2048,
+            }
+            
+            model = genai.GenerativeModel(
+                model_name=self.gemini_config["model"],
+                generation_config=generation_config
+            )
+            
+            return model
+            
+        except ImportError:
+            # Fallback to LangChain Gemini
+            from langchain_google_genai import ChatGoogleGenerativeAI
+            
+            return ChatGoogleGenerativeAI(
+                model=self.gemini_config["model"],
+                temperature=self.gemini_config["temperature"],
+                top_p=self.gemini_config["top_p"],
+                google_api_key="your-google-api-key"
+            )
+    
+    def _create_jil_tool(self):
+        def call_jil_agent(query: str) -> Dict[str, Any]:
+            try:
+                payload = {"message": query, "session_id": "gemini_router"}
+                response = requests.post(
+                    self.config.jil_agent_url,
+                    json=payload,
+                    headers=self.config.headers,
+                    timeout=self.config.timeout
+                )
+                response.raise_for_status()
+                return {"success": True, "data": response.json(), "agent": "jil_agent"}
+            except Exception as e:
+                return {"success": False, "error": str(e), "agent": "jil_agent"}
+        
+        return call_jil_agent
+    
+    def _create_job_tool(self):
+        def call_job_agent(query: str) -> Dict[str, Any]:
+            try:
+                payload = {"message": query, "session_id": "gemini_router"}
+                response = requests.post(
+                    self.config.job_agent_url,
+                    json=payload,
+                    headers=self.config.headers,
+                    timeout=self.config.timeout
+                )
+                response.raise_for_status()
+                return {"success": True, "data": response.json(), "agent": "job_agent"}
+            except Exception as e:
+                return {"success": False, "error": str(e), "agent": "job_agent"}
+        
+        return call_job_agent
+    
+    def route_and_call(self, query: str, session_id: str, context: Dict = None) -> Dict[str, Any]:
+        """Route using Gemini and call appropriate agent"""
+        
+        try:
+            # Create Gemini-optimized routing prompt
+            routing_prompt = self._create_gemini_routing_prompt(query)
+            
+            # Get routing decision from Gemini
+            if hasattr(self.llm, 'generate_content'):
+                # Direct Gemini API
+                response = self.llm.generate_content(routing_prompt)
+                decision = response.text.strip().upper()
+            else:
+                # LangChain Gemini
+                decision = self.llm.predict(routing_prompt).strip().upper()
+            
+            logging.info(f"Gemini routing decision: {decision}")
+            
+            # Execute the appropriate tool
+            if "JIL" in decision or "JIL_AGENT" in decision:
+                result = self.jil_tool(query)
+                agent_used = "jil_agent"
+            elif "JOB" in decision or "JOB_AGENT" in decision:
+                result = self.job_tool(query)
+                agent_used = "job_agent"
+            else:
+                # Default to job agent for ambiguous cases
+                result = self.job_tool(query)
+                agent_used = "job_agent"
+            
+            return {
+                "success": result["success"],
+                "response": result.get("data", result.get("error")),
+                "agent_used": agent_used,
+                "tools_used": [agent_used],
+                "gemini_decision": decision,
+                "session_id": session_id,
+                "llm_model": self.gemini_config["model"]
+            }
+            
+        except Exception as e:
+            logging.error(f"Gemini router error: {str(e)}")
+            return {
+                "success": False,
+                "error": str(e),
+                "session_id": session_id,
+                "llm_model": self.gemini_config["model"]
+            }
+    
+    def _create_gemini_routing_prompt(self, query: str) -> str:
+        """Create routing prompt optimized for Gemini"""
+        
+        return f"""You are an intelligent AutoSys query router. Analyze the user query and route it to the appropriate agent.
+
+AGENTS:
+1. JIL_AGENT: Handles JIL, Confluence, Autoping, Connection Profile, onboarding, how-to guides, and general system usage
+2. JOB_AGENT: Handles job status, job names, job failures, calendars, next start time, and job-related troubleshooting
+
+ROUTING RULES:
+- JIL_AGENT for: onboarding, connection profiles, how-to guides, system setup, JIL configuration
+- JOB_AGENT for: job status, job failures, scheduling, job execution, performance monitoring
+
+EXAMPLES:
+"how to onboard a new application in autosys" → JIL_AGENT
+"what is the connection profile for DA3" → JIL_AGENT
+"list all the jobs starting with ATSYS in DA3" → JOB_AGENT
+"show job failures in last 24 hours" → JOB_AGENT
+"provide next start time of the job" → JOB_AGENT
+
+USER QUERY: "{query}"
+
+RESPONSE: Respond with only "JIL_AGENT" or "JOB_AGENT" based on the query analysis."""
+
+# USAGE WITH YOUR EXISTING get_llm FUNCTION
+def integrate_with_existing_get_llm(get_llm_function):
+    """Integrate with your existing get_llm function"""
+    
+    class CustomGeminiRouter:
+        def __init__(self, config: APIConfig, llm_params: Dict = None):
+            self.config = config
+            self.llm_params = llm_params or {
+                "framework": "langchain",
+                "model": "gemini-1.5-pro-002",
+                "temperature": 0.1,
+                "top_p": 1
+            }
+            
+            # Use your existing get_llm function
+            self.llm = get_llm_function(
+                self.llm_params["framework"],
+                self.llm_params["model"], 
+                self.llm_params["temperature"],
+                self.llm_params["top_p"]
+            )
+            
+            # Create tools
+            self.tools = [self._create_jil_tool(), self._create_job_tool()]
+            self.agent = self._create_agent_with_your_llm()
+        
+        def _create_agent_with_your_llm(self):
+            """Create agent using your LLM instance"""
+            
+            from langchain.agents import create_tool_calling_agent, AgentExecutor
+            from langchain.prompts import ChatPromptTemplate
+            
+            prompt = ChatPromptTemplate.from_messages([
+                ("system", """You are an AutoSys router. Use the available tools to answer user queries.
+                
+Available tools:
+- call_jil_agent: For JIL, onboarding, connection profiles, how-to guides
+- call_job_agent: For job status, failures, scheduling, performance
+
+ALWAYS use one of the tools - never respond without calling a tool."""),
+                ("user", "{input}"),
+                ("placeholder", "{agent_scratchpad}"),
+            ])
+            
+            agent = create_tool_calling_agent(self.llm, self.tools, prompt)
+            
+            return AgentExecutor(
+                agent=agent,
+                tools=self.tools,
+                verbose=True,
+                return_intermediate_steps=True,
+                handle_parsing_errors=True
+            )
+        
+        def _create_jil_tool(self):
+            from langchain.tools import tool
+            
+            @tool
+            def call_jil_agent(query: str) -> str:
+                """Call JIL agent for onboarding, connection profiles, how-to guides"""
+                try:
+                    payload = {"message": query, "session_id": "custom_router"}
+                    response = requests.post(self.config.jil_agent_url, json=payload, timeout=30)
+                    return f"JIL Agent: {response.json()}"
+                except Exception as e:
+                    return f"JIL Agent Error: {str(e)}"
+            
+            return call_jil_agent
+        
+        def _create_job_tool(self):
+            from langchain.tools import tool
+            
+            @tool 
+            def call_job_agent(query: str) -> str:
+                """Call Job agent for job status, failures, scheduling"""
+                try:
+                    payload = {"message": query, "session_id": "custom_router"}
+                    response = requests.post(self.config.job_agent_url, json=payload, timeout=30)
+                    return f"Job Agent: {response.json()}"
+                except Exception as e:
+                    return f"Job Agent Error: {str(e)}"
+            
+            return call_job_agent
+        
+        def route_and_call(self, query: str, session_id: str, context: Dict = None):
+            """Route and call using your LLM"""
+            try:
+                result = self.agent.invoke({"input": query})
+                
+                return {
+                    "success": True,
+                    "response": result["output"],
+                    "tools_used": [step[0].tool for step in result.get("intermediate_steps", [])],
+                    "session_id": session_id,
+                    "llm_model": self.llm_params["model"]
+                }
+            except Exception as e:
+                return {
+                    "success": False,
+                    "error": str(e),
+                    "session_id": session_id
+                }
+    
+    return CustomGeminiRouter
+def test_fixed_router():
+    """Test the fixed router with actual tool calls"""
+    
+    print("🧪 TESTING FIXED ROUTER")
+    print("=" * 50)
+    
+    test_queries = [
+        ("how to onboard a new application in autosys", "Should call JIL agent"),
+        ("what is the connection profile for DA3", "Should call JIL agent"),
+        ("list all the jobs starting with ATSYS in DA3", "Should call JOB agent"),
+        ("show job failures in last 24 hours", "Should call JOB agent"),
+        ("provide next start time of the job", "Should call JOB agent")
+    ]
+    
+    for query, expected in test_queries:
+        print(f"\nQuery: '{query}'")
+        print(f"Expected: {expected}")
+        
+        try:
+            result = router.route_and_call(query, "test_session")
+            print(f"Success: {result['success']}")
+            print(f"Tools Used: {result.get('tools_used', [])}")
+            print(f"Response: {result.get('response', '')[:100]}...")
+            
+        except Exception as e:
+            print(f"Error: {str(e)}")
+        
+        print("-" * 40)
+
+if __name__ == "__main__":
+    test_fixed_router()
+
+
+
+********************
+
+
+
+
 import requests
 import re
 from typing import Dict, Any, Optional
