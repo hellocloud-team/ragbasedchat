@@ -1,3 +1,626 @@
+vcvv"""''''''''''''''’""''
+# SESSION-AWARE MULTI-AGENT ROUTER WITH CONTEXT FORWARDING
+
+from typing import Dict, Any, Optional, List
+import json
+import logging
+import re
+from dataclasses import dataclass, asdict
+from datetime import datetime
+import requests
+
+@dataclass
+class SessionContext:
+    """Session context to store extracted information across conversations"""
+    session_id: str
+    job_name: Optional[str] = None
+    instance_name: Optional[str] = None
+    last_agent_used: Optional[str] = None
+    conversation_history: List[Dict] = None
+    extracted_entities: Dict[str, Any] = None
+    
+    def __post_init__(self):
+        if self.conversation_history is None:
+            self.conversation_history = []
+        if self.extracted_entities is None:
+            self.extracted_entities = {}
+    
+    def add_conversation(self, user_query: str, agent_used: str, response: str, extracted_data: Dict = None):
+        """Add conversation to history with extracted data"""
+        entry = {
+            "timestamp": datetime.now().isoformat(),
+            "user_query": user_query,
+            "agent_used": agent_used,
+            "response": response[:200],  # Truncate for storage
+            "extracted_data": extracted_data or {}
+        }
+        self.conversation_history.append(entry)
+        
+        # Keep only last 10 conversations
+        if len(self.conversation_history) > 10:
+            self.conversation_history = self.conversation_history[-10:]
+    
+    def update_entities(self, new_entities: Dict[str, Any]):
+        """Update extracted entities"""
+        self.extracted_entities.update(new_entities)
+    
+    def get_context_summary(self) -> str:
+        """Get summary of current context for LLM"""
+        context_parts = []
+        
+        if self.job_name:
+            context_parts.append(f"Job Name: {self.job_name}")
+        if self.instance_name:
+            context_parts.append(f"Instance: {self.instance_name}")
+        if self.last_agent_used:
+            context_parts.append(f"Last Agent: {self.last_agent_used}")
+        
+        if self.extracted_entities:
+            for key, value in self.extracted_entities.items():
+                if value:
+                    context_parts.append(f"{key}: {value}")
+        
+        return " | ".join(context_parts) if context_parts else "No context available"
+
+class EntityExtractor:
+    """Extract entities from user queries and agent responses using LLM"""
+    
+    def __init__(self, get_llm_function):
+        self.llm = get_llm_function("langchain")
+    
+    def extract_from_query(self, query: str) -> Dict[str, Any]:
+        """Extract job name, instance name, and other entities from user query"""
+        
+        extraction_prompt = f"""Extract AutoSys-related entities from this user query:
+
+Query: "{query}"
+
+Extract the following if present:
+1. Job Name: Any job identifier, name, or ID
+2. Instance Name: AutoSys instance (DA3, DB3, DC3, DG3, LS3)
+3. Time References: Dates, time periods, "last 24 hours", etc.
+4. Status Types: running, failed, success, pending, etc.
+5. Other Entities: calendar names, application names, etc.
+
+Respond in JSON format:
+{{
+    "job_name": "job_name_if_found_or_null",
+    "instance_name": "instance_if_found_or_null",
+    "time_reference": "time_reference_if_found_or_null",
+    "status_type": "status_if_found_or_null",
+    "other_entities": {{"key": "value"}}
+}}
+
+Only include entities that are explicitly mentioned. Use null for missing entities."""
+        
+        try:
+            if hasattr(self.llm, 'predict'):
+                response = self.llm.predict(extraction_prompt)
+            elif hasattr(self.llm, 'invoke'):
+                response = self.llm.invoke(extraction_prompt).content
+            else:
+                response = str(self.llm(extraction_prompt))
+            
+            # Try to parse JSON response
+            try:
+                entities = json.loads(response.strip())
+                return entities
+            except json.JSONDecodeError:
+                # Fallback to regex extraction
+                return self._regex_fallback_extraction(query)
+                
+        except Exception as e:
+            logging.error(f"Entity extraction failed: {e}")
+            return self._regex_fallback_extraction(query)
+    
+    def _regex_fallback_extraction(self, query: str) -> Dict[str, Any]:
+        """Fallback regex-based entity extraction"""
+        
+        entities = {
+            "job_name": None,
+            "instance_name": None,
+            "time_reference": None,
+            "status_type": None,
+            "other_entities": {}
+        }
+        
+        query_upper = query.upper()
+        
+        # Extract instance name
+        instances = ["DA3", "DB3", "DC3", "DG3", "LS3"]
+        for instance in instances:
+            if instance in query_upper:
+                entities["instance_name"] = instance
+                break
+        
+        # Extract job name patterns
+        job_patterns = [
+            r'job\s+([A-Z0-9_]+)',
+            r'([A-Z0-9_]{3,})\s+job',
+            r'job\s*:\s*([A-Z0-9_]+)',
+            r'([A-Z0-9_]+)\s+status'
+        ]
+        
+        for pattern in job_patterns:
+            match = re.search(pattern, query_upper)
+            if match:
+                entities["job_name"] = match.group(1)
+                break
+        
+        # Extract status types
+        status_patterns = ['RUNNING', 'FAILED', 'SUCCESS', 'PENDING', 'HOLD']
+        for status in status_patterns:
+            if status in query_upper:
+                entities["status_type"] = status
+                break
+        
+        return entities
+    
+    def extract_from_response(self, response_text: str, agent_type: str) -> Dict[str, Any]:
+        """Extract entities from agent responses"""
+        
+        extraction_prompt = f"""Extract information provided by the {agent_type} agent:
+
+Agent Response: "{response_text}"
+
+Extract any mentioned:
+1. Job Names/IDs
+2. Instance Names
+3. Dates/Times
+4. Status Information
+5. Other relevant data
+
+Respond in JSON format with extracted information."""
+        
+        try:
+            if hasattr(self.llm, 'predict'):
+                response = self.llm.predict(extraction_prompt)
+            else:
+                response = str(self.llm(extraction_prompt))
+            
+            return json.loads(response.strip())
+        except:
+            return {}
+
+class SessionAwareRouter:
+    """Router with session memory and intelligent context forwarding"""
+    
+    def __init__(self, config, get_llm_function):
+        self.config = config
+        self.get_llm_function = get_llm_function
+        self.llm = get_llm_function("langchain")
+        
+        # Session storage (in production, use Redis or database)
+        self.sessions: Dict[str, SessionContext] = {}
+        
+        # Entity extractor
+        self.entity_extractor = EntityExtractor(get_llm_function)
+        
+        # Tools
+        self.jil_tool = self._create_jil_tool()
+        self.job_tool = self._create_job_tool()
+    
+    def _get_or_create_session(self, session_id: str) -> SessionContext:
+        """Get existing session or create new one"""
+        if session_id not in self.sessions:
+            self.sessions[session_id] = SessionContext(session_id=session_id)
+        return self.sessions[session_id]
+    
+    def _create_jil_tool(self):
+        def call_jil_api_with_context(query: str, session_id: str, context: Dict = None) -> Dict[str, Any]:
+            try:
+                payload = {
+                    "message": query,
+                    "session_id": session_id,
+                    "context": context or {}
+                }
+                
+                response = requests.post(
+                    self.config.jil_agent_url,
+                    json=payload,
+                    headers=self.config.headers,
+                    timeout=self.config.timeout
+                )
+                response.raise_for_status()
+                
+                return {
+                    "success": True,
+                    "data": response.json(),
+                    "agent": "jil_agent"
+                }
+            except Exception as e:
+                return {
+                    "success": False,
+                    "error": str(e),
+                    "agent": "jil_agent"
+                }
+        
+        return call_jil_api_with_context
+    
+    def _create_job_tool(self):
+        def call_job_api_with_context(query: str, session_id: str, context: Dict = None) -> Dict[str, Any]:
+            try:
+                payload = {
+                    "message": query,
+                    "session_id": session_id,
+                    "context": context or {}
+                }
+                
+                response = requests.post(
+                    self.config.job_agent_url,
+                    json=payload,
+                    headers=self.config.headers,
+                    timeout=self.config.timeout
+                )
+                response.raise_for_status()
+                
+                return {
+                    "success": True,
+                    "data": response.json(),
+                    "agent": "job_agent"
+                }
+            except Exception as e:
+                return {
+                    "success": False,
+                    "error": str(e),
+                    "agent": "job_agent"
+                }
+        
+        return call_job_api_with_context
+    
+    def _determine_routing_with_context(self, query: str, session: SessionContext) -> str:
+        """Determine routing considering session context"""
+        
+        routing_prompt = f"""You are an intelligent AutoSys query router with session awareness.
+
+CURRENT SESSION CONTEXT:
+{session.get_context_summary()}
+
+RECENT CONVERSATION:
+{json.dumps(session.conversation_history[-3:], indent=2) if session.conversation_history else "No previous conversation"}
+
+AGENT CAPABILITIES:
+🔧 JIL_AGENT: JIL syntax, onboarding, connection profiles, configuration, how-to guides
+📊 JOB_AGENT: Job status, execution details, creation dates, job failures, scheduling, performance
+
+CONTEXT-AWARE ROUTING RULES:
+1. If job name and instance are already known in session, use that context
+2. For follow-up questions about the same job, route based on the question type
+3. Creation date, execution details, job history → JOB_AGENT
+4. JIL syntax, configuration, setup → JIL_AGENT
+
+USER QUERY: "{query}"
+
+ROUTING DECISION: Respond with "JIL_AGENT" or "JOB_AGENT" considering the context."""
+        
+        try:
+            if hasattr(self.llm, 'predict'):
+                response = self.llm.predict(routing_prompt)
+            else:
+                response = str(self.llm(routing_prompt))
+            
+            decision = response.strip().upper()
+            return "JIL_AGENT" if "JIL_AGENT" in decision else "JOB_AGENT"
+            
+        except Exception as e:
+            logging.error(f"Routing decision failed: {e}")
+            return "JOB_AGENT"  # Default
+    
+    def _enhance_query_with_context(self, query: str, session: SessionContext, target_agent: str) -> str:
+        """Enhance query with session context before sending to agent"""
+        
+        enhancement_prompt = f"""Enhance this user query with available session context for the {target_agent}.
+
+ORIGINAL QUERY: "{query}"
+
+AVAILABLE SESSION CONTEXT:
+- Job Name: {session.job_name or 'Not available'}
+- Instance Name: {session.instance_name or 'Not available'}
+- Previous Context: {session.get_context_summary()}
+
+ENHANCEMENT RULES:
+1. If job name and instance are available in context but not in query, add them
+2. If this is a follow-up question, make the context explicit
+3. Keep the original intent but add necessary context
+4. Don't duplicate information already in the query
+
+ENHANCED QUERY: Provide the enhanced version that includes necessary context."""
+        
+        try:
+            if hasattr(self.llm, 'predict'):
+                enhanced = self.llm.predict(enhancement_prompt)
+            else:
+                enhanced = str(self.llm(enhancement_prompt))
+            
+            # Extract just the enhanced query part
+            enhanced_query = enhanced.strip()
+            if "ENHANCED QUERY:" in enhanced_query:
+                enhanced_query = enhanced_query.split("ENHANCED QUERY:")[-1].strip()
+            
+            return enhanced_query
+            
+        except Exception as e:
+            logging.error(f"Query enhancement failed: {e}")
+            # Fallback: manually add context
+            context_parts = []
+            if session.job_name and session.job_name not in query:
+                context_parts.append(f"job name {session.job_name}")
+            if session.instance_name and session.instance_name not in query:
+                context_parts.append(f"instance {session.instance_name}")
+            
+            if context_parts:
+                return f"{query} (using {', '.join(context_parts)} from session context)"
+            else:
+                return query
+    
+    def route_and_call(self, query: str, session_id: str, context: Dict = None) -> Dict[str, Any]:
+        """Main routing function with session awareness"""
+        
+        try:
+            # Get or create session
+            session = self._get_or_create_session(session_id)
+            
+            logging.info(f"🔄 Session-aware routing for: '{query}'")
+            logging.info(f"📊 Current context: {session.get_context_summary()}")
+            
+            # Extract entities from current query
+            query_entities = self.entity_extractor.extract_from_query(query)
+            logging.info(f"🔍 Extracted entities: {query_entities}")
+            
+            # Update session with new entities
+            if query_entities.get("job_name"):
+                session.job_name = query_entities["job_name"]
+            if query_entities.get("instance_name"):
+                session.instance_name = query_entities["instance_name"]
+            
+            session.update_entities(query_entities)
+            
+            # Determine routing with session context
+            routing_decision = self._determine_routing_with_context(query, session)
+            
+            # Enhance query with session context
+            enhanced_query = self._enhance_query_with_context(query, session, routing_decision)
+            
+            logging.info(f"🎯 Routing to: {routing_decision}")
+            logging.info(f"🔧 Enhanced query: '{enhanced_query}'")
+            
+            # Prepare context for agent
+            agent_context = {
+                "session_context": asdict(session),
+                "original_query": query,
+                "enhanced_query": enhanced_query,
+                "routing_reason": f"Routed to {routing_decision} based on context analysis"
+            }
+            
+            # Call appropriate agent
+            if routing_decision == "JIL_AGENT":
+                result = self.jil_tool(enhanced_query, session_id, agent_context)
+                agent_used = "jil_agent"
+            else:
+                result = self.job_tool(enhanced_query, session_id, agent_context)
+                agent_used = "job_agent"
+            
+            # Extract entities from agent response
+            if result["success"]:
+                response_entities = self.entity_extractor.extract_from_response(
+                    str(result["data"]), agent_used
+                )
+                session.update_entities(response_entities)
+            
+            # Update session history
+            session.last_agent_used = agent_used
+            session.add_conversation(
+                query, 
+                agent_used, 
+                str(result.get("data", result.get("error", ""))),
+                {**query_entities, **response_entities} if result["success"] else query_entities
+            )
+            
+            return {
+                "success": result["success"],
+                "response": result.get("data", result.get("error")),
+                "agent_used": agent_used,
+                "routing_decision": routing_decision,
+                "original_query": query,
+                "enhanced_query": enhanced_query,
+                "session_context": session.get_context_summary(),
+                "extracted_entities": query_entities,
+                "session_id": session_id,
+                "context_forwarded": enhanced_query != query
+            }
+            
+        except Exception as e:
+            logging.error(f"Session-aware routing error: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+                "session_id": session_id,
+                "original_query": query
+            }
+    
+    def get_session_info(self, session_id: str) -> Dict[str, Any]:
+        """Get session information for debugging"""
+        if session_id in self.sessions:
+            session = self.sessions[session_id]
+            return {
+                "session_id": session_id,
+                "context_summary": session.get_context_summary(),
+                "conversation_count": len(session.conversation_history),
+                "last_agent": session.last_agent_used,
+                "entities": session.extracted_entities
+            }
+        else:
+            return {"session_id": session_id, "status": "not_found"}
+    
+    def clear_session(self, session_id: str) -> Dict[str, Any]:
+        """Clear session data"""
+        if session_id in self.sessions:
+            del self.sessions[session_id]
+            return {"session_id": session_id, "status": "cleared"}
+        else:
+            return {"session_id": session_id, "status": "not_found"}
+
+# TESTING SCENARIO
+def test_session_aware_routing(get_llm_function):
+    """Test the session-aware routing with context forwarding"""
+    
+    print("🧪 TESTING SESSION-AWARE ROUTING")
+    print("=" * 60)
+    
+    # Configuration
+    config = APIConfig(
+        jil_agent_url="http://localhost:8081/chat-atsys",
+        job_agent_url="http://localhost:8080/chat"
+    )
+    
+    # Create session-aware router
+    router = SessionAwareRouter(config, get_llm_function)
+    
+    # Test scenario: JIL query followed by job query
+    session_id = "test_session_123"
+    
+    test_conversation = [
+        {
+            "query": "I need the JIL of job ATSYS_DAILY_BACKUP on instance DA3",
+            "expected_agent": "jil_agent",
+            "description": "Initial JIL request - should extract job name and instance"
+        },
+        {
+            "query": "What is the creation date of this job?",
+            "expected_agent": "job_agent",
+            "description": "Follow-up about creation date - should use context from previous query"
+        },
+        {
+            "query": "Show me the job dependencies",
+            "expected_agent": "job_agent", 
+            "description": "Another follow-up - should continue using same context"
+        },
+        {
+            "query": "How do I modify the JIL for a different schedule?",
+            "expected_agent": "jil_agent",
+            "description": "New JIL question - should still use job context if relevant"
+        }
+    ]
+    
+    for i, test in enumerate(test_conversation, 1):
+        print(f"\n{i}. {test['description']}")
+        print(f"   Query: '{test['query']}'")
+        print(f"   Expected Agent: {test['expected_agent']}")
+        
+        try:
+            # Show session before query
+            session_info = router.get_session_info(session_id)
+            print(f"   Session Before: {session_info.get('context_summary', 'Empty')}")
+            
+            # Execute query
+            result = router.route_and_call(test['query'], session_id)
+            
+            print(f"   ✅ Success: {result['success']}")
+            print(f"   🎯 Agent Used: {result['agent_used']}")
+            print(f"   🔄 Context Forwarded: {result['context_forwarded']}")
+            print(f"   🔧 Enhanced Query: '{result['enhanced_query']}'")
+            print(f"   📊 Session Context: {result['session_context']}")
+            
+        except Exception as e:
+            print(f"   ❌ Error: {str(e)}")
+        
+        print("-" * 50)
+    
+    # Show final session state
+    print(f"\n📊 FINAL SESSION STATE:")
+    final_session = router.get_session_info(session_id)
+    print(json.dumps(final_session, indent=2))
+
+# FASTAPI INTEGRATION
+def create_session_aware_fastapi(get_llm_function):
+    """Create FastAPI app with session-aware routing"""
+    
+    @asynccontextmanager 
+    async def lifespan(app: FastAPI):
+        logging.info("Starting Session-Aware Router API...")
+        yield
+        logging.info("Shutting down Session-Aware Router API...")
+    
+    # Configuration
+    config = APIConfig(
+        jil_agent_url="http://localhost:8081/chat-atsys",
+        job_agent_url="http://localhost:8080/chat"
+    )
+    
+    # Create session-aware router
+    router = SessionAwareRouter(config, get_llm_function)
+    
+    app = FastAPI(title="Session-Aware Multi-Agent Router", lifespan=lifespan)
+    
+    @app.post("/chat-atsys-route")
+    def chat_with_session_awareness(request: ChatRequest):
+        if not request.message.strip():
+            raise HTTPException(status_code=400, detail="No message provided")
+        
+        try:
+            result = router.route_and_call(
+                request.message, 
+                request.session_id, 
+                request.context
+            )
+            return result
+            
+        except Exception as e:
+            logging.error(f"Session-aware chat error: {str(e)}")
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    @app.get("/session/{session_id}")
+    def get_session(session_id: str):
+        """Get session information"""
+        return router.get_session_info(session_id)
+    
+    @app.delete("/session/{session_id}")
+    def clear_session(session_id: str):
+        """Clear session data"""
+        return router.clear_session(session_id)
+    
+    @app.get("/health")
+    def health():
+        return {
+            "status": "healthy",
+            "router_type": "session_aware_multi_agent",
+            "features": ["context_forwarding", "entity_extraction", "session_memory"]
+        }
+    
+    return app
+
+if __name__ == "__main__":
+    # Mock get_llm function for testing
+    def mock_get_llm(framework):
+        return "Mock Gemini LLM"
+    
+    # Test the session-aware routing
+    test_session_aware_routing(mock_get_llm)
+    
+    print("\n" + "=" * 60)
+    print("🎯 SESSION-AWARE ROUTING READY")
+    print("=" * 60)
+    
+    print("""
+✅ Key Features Implemented:
+
+1. 🧠 Session Memory: Remembers job names, instances, and context
+2. 🔄 Context Forwarding: Passes previous info to new queries  
+3. 🎯 Intelligent Routing: Routes based on question type + context
+4. 🔍 Entity Extraction: Extracts job names, instances from queries
+5. 🔧 Query Enhancement: Adds context to queries automatically
+
+✅ Example Flow:
+1. "JIL of job ATSYS_BACKUP on DA3" → JIL Agent (stores job + instance)
+2. "What's the creation date?" → Job Agent + context forwarded
+3. "Show dependencies" → Job Agent + same context
+    
+✅ This eliminates re-asking for job name and instance!
+    """)
+££££££££££££¢£££¢
+
+
+
 # FIXED ROUTER WITH PROPER TOOL CALLING
 
 from fastapi import FastAPI, HTTPException
