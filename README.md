@@ -1,5 +1,121 @@
 
 def extract_parameters_llm_node(self, state: AutosysState) -> AutosysState:
+    """Extract parameters while preserving ALL previous values."""
+    try:
+        session_id = state["session_id"]
+        
+        # Get existing parameters from session
+        session_context = session_manager.get_session_context(session_id)
+        existing_params = session_context.get("extracted_params", {})
+        
+        # CRITICAL: Check what we already have
+        self.logger.info(f"Existing params from session: {existing_params}")
+        
+        # Build the extraction prompt with explicit context preservation
+        extraction_prompt = f"""
+You MUST preserve previously extracted parameters. Analyze this query in context:
+
+CURRENT QUERY: "{state['user_question']}"
+
+ALREADY EXTRACTED (DO NOT LOSE THESE):
+- Instance: {existing_params.get('instance', 'NOT SET')}
+- Job Name: {existing_params.get('job_name', 'NOT SET')}
+- Calendar Name: {existing_params.get('calendar_name', 'NOT SET')}
+
+AVAILABLE INSTANCES: {', '.join(self.db_manager.list_instances())}
+
+RULES:
+1. If a parameter is ALREADY SET above, you MUST include it in your response
+2. Only extract NEW parameters from the current query
+3. Combine previous + new parameters in your response
+4. If current query only provides instance, keep the previous job_name/calendar_name
+
+Return JSON:
+{{
+    "extracted_instance": "current_or_previous_instance",
+    "extracted_job_name": "current_or_previous_job_name",
+    "extracted_calendar_name": "current_or_previous_calendar_name",
+    "user_intent": "what_user_wants"
+}}
+
+EXAMPLE: If previous had job_name="job123" and current query is "DA3", respond:
+{{
+    "extracted_instance": "DA3",
+    "extracted_job_name": "job123",
+    "extracted_calendar_name": null,
+    "user_intent": "provide_missing_instance"
+}}
+"""
+        
+        response = self.cached_llm_invoke(extraction_prompt)
+        extraction_result = self._safe_parse_llm_json(response)
+        
+        # DEFENSIVE MERGING: Never lose existing values
+        merged_params = {}
+        
+        # For each parameter, use this priority: new_value > existing_value > None
+        merged_params["instance"] = (
+            extraction_result.get("extracted_instance") 
+            or existing_params.get("instance") 
+            or ""
+        )
+        
+        merged_params["job_name"] = (
+            extraction_result.get("extracted_job_name") 
+            or existing_params.get("job_name") 
+            or ""
+        )
+        
+        merged_params["calendar_name"] = (
+            extraction_result.get("extracted_calendar_name") 
+            or existing_params.get("calendar_name") 
+            or ""
+        )
+        
+        # Clean up null/none strings
+        for key in merged_params:
+            if merged_params[key] and merged_params[key].lower() in ["null", "none"]:
+                merged_params[key] = ""
+        
+        # Determine what's STILL missing after merge
+        missing = []
+        if not merged_params.get("instance"):
+            missing.append("instance name")
+        if not (merged_params.get("job_name") or merged_params.get("calendar_name")):
+            missing.append("job name or calendar name")
+        
+        # Update state with merged values
+        state["extracted_instance"] = merged_params["instance"]
+        state["extracted_job_name"] = merged_params["job_name"]
+        state["extracted_calendar_name"] = merged_params["calendar_name"]
+        state["missing_parameters"] = missing
+        
+        # CRITICAL: Save merged params back to session
+        session_manager.update_session_context(session_id, {
+            "extracted_params": merged_params,
+            "user_intent": extraction_result.get("user_intent", ""),
+            "pending_clarification": bool(missing)
+        })
+        
+        self.logger.info(
+            f"Session {session_id} - "
+            f"Previous: {existing_params} | "
+            f"Extracted: {extraction_result} | "
+            f"Merged: {merged_params} | "
+            f"Missing: {missing}"
+        )
+        
+    except Exception as e:
+        self.logger.error(f"Parameter extraction failed: {str(e)}")
+        state["missing_parameters"] = ["extraction_error"]
+    
+    return state
+
+
+
+
+
+def extract_parameters_llm_node(self, state: AutosysState) -> AutosysState:
     """Extract parameters while preserving session context and avoiding redundant prompts."""
     try:
         session_id = state["session_id"]
