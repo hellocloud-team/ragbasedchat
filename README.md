@@ -1,3 +1,122 @@
+
+def extract_parameters_llm_node(self, state: AutosysState) -> AutosysState:
+    """Extract parameters while preserving session context and avoiding redundant prompts."""
+    try:
+        session_id = state["session_id"]
+        
+        # Get existing session context
+        session_context = session_manager.get_session_context(session_id)
+        existing_params = session_context.get("extracted_params", {})
+        
+        # CRITICAL: Only extract if we're missing required parameters
+        current_missing = []
+        if not existing_params.get("instance"):
+            current_missing.append("instance name")
+        if not (existing_params.get("job_name") or existing_params.get("calendar_name")):
+            current_missing.append("job name or calendar name")
+        
+        # If we already have all required parameters, skip extraction
+        if not current_missing:
+            self.logger.info(f"All parameters available from context: {existing_params}")
+            return state
+        
+        # Create extraction prompt that explicitly preserves existing values
+        extraction_prompt = f"""
+Extract parameters from this query, considering previous context:
+
+CURRENT USER QUERY: "{state['user_question']}"
+
+PREVIOUS EXTRACTED PARAMETERS: {json.dumps(existing_params, indent=2)}
+STILL MISSING: {', '.join(current_missing)}
+
+AVAILABLE INSTANCES: {', '.join(self.db_manager.list_instances())}
+
+Instructions:
+1. Extract any NEW parameters from the current query
+2. PRESERVE all parameters from PREVIOUS EXTRACTED PARAMETERS
+3. Only mark as null if explicitly stated as unknown in current query
+4. If user provides missing information, use it to fill gaps
+
+Return ONLY JSON:
+{{
+    "extracted_instance": "instance_name_or_use_previous_or_null",
+    "extracted_job_name": "job_name_or_use_previous_or_null",
+    "extracted_calendar_name": "calendar_name_or_use_previous_or_null",
+    "user_intent": "what_user_wants_to_do",
+    "context_used": true_if_previous_context_was_helpful,
+    "missing_still": ["list", "of", "still_missing", "params"]
+}}
+"""
+        
+        response = self.cached_llm_invoke(extraction_prompt)
+        extraction_result = self._safe_parse_llm_json(response)
+        
+        if not extraction_result:
+            extraction_result = {"missing_still": current_missing}
+        
+        # IMPROVED MERGING: Prioritize existing values, only update with new non-null values
+        merged_params = existing_params.copy()  # Start with what we have
+        
+        # Only update if new value is provided and not null
+        new_instance = extraction_result.get("extracted_instance")
+        if new_instance and new_instance.lower() not in ["null", "none", ""]:
+            merged_params["instance"] = new_instance
+        
+        new_job = extraction_result.get("extracted_job_name")
+        if new_job and new_job.lower() not in ["null", "none", ""]:
+            merged_params["job_name"] = new_job
+        
+        new_calendar = extraction_result.get("extracted_calendar_name")
+        if new_calendar and new_calendar.lower() not in ["null", "none", ""]:
+            merged_params["calendar_name"] = new_calendar
+        
+        # Determine what's still missing AFTER merge
+        missing = []
+        if not merged_params.get("instance"):
+            missing.append("instance name")
+        if not (merged_params.get("job_name") or merged_params.get("calendar_name")):
+            missing.append("job name or calendar name")
+        
+        # Update state
+        state["extracted_instance"] = merged_params.get("instance", "")
+        state["extracted_job_name"] = merged_params.get("job_name", "")
+        state["extracted_calendar_name"] = merged_params.get("calendar_name", "")
+        state["missing_parameters"] = missing
+        
+        # Update session context with merged parameters
+        session_manager.update_session_context(session_id, {
+            "extracted_params": merged_params,
+            "user_intent": extraction_result.get("user_intent", ""),
+            "pending_clarification": bool(missing)
+        })
+        
+        # Store extraction for debugging
+        if "llm_analysis" not in state:
+            state["llm_analysis"] = {}
+        state["llm_analysis"]["extraction_with_memory"] = {
+            "previous_params": existing_params,
+            "new_extraction": extraction_result,
+            "merged_params": merged_params,
+            "still_missing": missing
+        }
+        
+        self.logger.info(f"Session {session_id} - Merged params: {merged_params}, Missing: {missing}")
+        
+    except Exception as e:
+        self.logger.error(f"Parameter extraction with memory failed: {str(e)}")
+        state["missing_parameters"] = ["extraction_error"]
+    
+    return state
+
+
+
+
+
+
+
+
+
+
 vcvv"""''''''''''''''’""''
 # SESSION-AWARE MULTI-AGENT ROUTER WITH CONTEXT FORWARDING
 
