@@ -1,4 +1,151 @@
 
+DB1_USER=scott
+DB1_PASS=tiger
+DB1_DSN=localhost:1521/ORCLPDB1
+
+DB2_USER=scott
+DB2_PASS=tiger
+DB2_DSN=otherhost:1521/ORCLPDB2
+
+DB3_USER=hr
+DB3_PASS=hrpass
+DB3_DSN=db3host:1521/ORCLPDB3
+
+DB4_USER=hr
+DB4_PASS=hrpass
+DB4_DSN=db4host:1521/ORCLPDB4
+
+
+
+import os
+import re
+import sqlparse
+import pandas as pd
+import oracledb
+from flask import Flask, request, jsonify
+from dotenv import load_dotenv
+from collections import defaultdict
+
+load_dotenv()
+app = Flask(__name__)
+
+# --- Oracle DB connection configs ---
+DB_CONFIG = {
+    "db1": {"user": os.getenv("DB1_USER"), "password": os.getenv("DB1_PASS"), "dsn": os.getenv("DB1_DSN")},
+    "db2": {"user": os.getenv("DB2_USER"), "password": os.getenv("DB2_PASS"), "dsn": os.getenv("DB2_DSN")},
+    "db3": {"user": os.getenv("DB3_USER"), "password": os.getenv("DB3_PASS"), "dsn": os.getenv("DB3_DSN")},
+    "db4": {"user": os.getenv("DB4_USER"), "password": os.getenv("DB4_PASS"), "dsn": os.getenv("DB4_DSN")},
+}
+
+# Restrict which tables can be queried
+ALLOWED_TABLES = ["employees", "orders", "customers"]
+MAX_ROWS_RETURN = 50
+
+# --- Session memory ---
+SESSIONS = defaultdict(dict)
+
+# ---------- Gemini Stub ----------
+def call_gemini_generate_sql(nl_query: str, allowed_tables: list) -> str:
+    """
+    In production: call Gemini API with a strong prompt.
+    For now: simple stub that switches based on keywords.
+    """
+    q = nl_query.lower()
+
+    if "order" in q:
+        return f"SELECT * FROM orders FETCH FIRST {MAX_ROWS_RETURN+1} ROWS ONLY"
+    elif "customer" in q:
+        return f"SELECT * FROM customers FETCH FIRST {MAX_ROWS_RETURN+1} ROWS ONLY"
+    else:
+        return f"SELECT * FROM employees FETCH FIRST {MAX_ROWS_RETURN+1} ROWS ONLY"
+
+# ---------- Safety ----------
+def safe_sql_check(sql: str, allowed_tables: list) -> bool:
+    stmts = sqlparse.split(sql)
+    if len(stmts) != 1:
+        return False
+    if not sql.lower().strip().startswith("select"):
+        return False
+    forbidden = re.compile(r"\b(insert|update|delete|drop|alter|truncate|create)\b", re.I)
+    if forbidden.search(sql):
+        return False
+
+    # check table names roughly
+    for table in allowed_tables:
+        if table in sql.lower():
+            return True
+    return False
+
+# ---------- Run Oracle query ----------
+def run_query(instance: str, sql: str):
+    if instance not in DB_CONFIG:
+        raise ValueError(f"Unknown DB instance {instance}")
+    cfg = DB_CONFIG[instance]
+    connection = oracledb.connect(user=cfg["user"], password=cfg["password"], dsn=cfg["dsn"])
+    with connection.cursor() as cursor:
+        cursor.execute(sql)
+        cols = [col[0] for col in cursor.description]
+        rows = cursor.fetchall()
+    connection.close()
+    return pd.DataFrame(rows, columns=cols)
+
+# ---------- Conversational endpoint ----------
+@app.route("/chat", methods=["POST"])
+def chat():
+    data = request.json or {}
+    session_id = data.get("session_id", "default")
+    nl_query = data.get("nl_query")
+    instance = data.get("instance")
+
+    state = SESSIONS[session_id]
+
+    # If query provided, save it
+    if nl_query:
+        state["nl_query"] = nl_query
+
+    # If no instance yet, ask for it
+    if not instance:
+        if "nl_query" not in state:
+            return jsonify({"message": "Please provide a question."}), 200
+        return jsonify({
+            "message": "Which DB instance should I run this on?",
+            "options": list(DB_CONFIG.keys())
+        }), 200
+
+    # Need a stored question
+    if "nl_query" not in state:
+        return jsonify({"message": "No question found in session, please ask again."}), 400
+
+    # Generate SQL from Gemini
+    sql = call_gemini_generate_sql(state["nl_query"], ALLOWED_TABLES)
+
+    if not safe_sql_check(sql, ALLOWED_TABLES):
+        return jsonify({"error": "Unsafe SQL generated", "sql": sql}), 400
+
+    try:
+        df = run_query(instance, sql)
+    except Exception as e:
+        return jsonify({"error": str(e), "sql": sql}), 500
+
+    rows = df.head(MAX_ROWS_RETURN).to_dict(orient="records")
+    return jsonify({
+        "sql": sql,
+        "columns": list(df.columns),
+        "rows": rows,
+        "total_rows": len(df),
+        "message": "Here are your results."
+    }), 200
+
+@app.route("/health")
+def health():
+    return {"status": "ok"}
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=True)
+
+
+
+
 def extract_parameters_llm_node(self, state: AutosysState) -> AutosysState:
     """Extract parameters while preserving ALL previous values."""
     try:
