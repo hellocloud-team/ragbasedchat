@@ -25,6 +25,32 @@ def check_db_connections(db_config: dict):
 
 
 
+if __name__ == "__main__":
+    print("Checking DB connections...")
+    db_status = check_db_connections(DB_CONFIG)
+    for instance, result in db_status.items():
+        print(f"{instance}: {result}")
+
+    # If any DB failed, optionally exit
+    if any("FAILED" in r for r in db_status.values()):
+        raise SystemExit("One or more DB connections failed. Fix credentials before starting.")
+
+    print("All DB connections OK. Starting Flask app...")
+    app.run(host="0.0.0.0", port=5000, debug=True)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 from langchain_openai import ChatOpenAI
 from vanna.remote import VannaDefault
