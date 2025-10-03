@@ -1,4 +1,147 @@
 
+from langchain_openai import ChatOpenAI
+from vanna.remote import VannaDefault
+import os
+
+def get_llm(provider: str, access_token: str = None):
+    """
+    Returns both:
+      - chat_llm: LangChain ChatOpenAI instance
+      - sql_llm: VannaDefault instance for SQL generation
+    """
+    access_token = access_token or os.getenv("GEMINI_API_KEY")
+
+    match provider.lower():
+        case "gemini":
+            # Chat model for conversation
+            chat_llm = ChatOpenAI(
+                model="gemini-2.5-pro",
+                api_key=access_token,
+                disable_streaming=True
+            )
+
+            # Vanna client for SQL
+            sql_llm = VannaDefault(model="gemini-2.5-pro", api_key=access_token)
+            return chat_llm, sql_llm
+
+        case _:
+            raise ValueError(f"Unsupported provider: {provider}")
+
+
+import yaml
+import pandas as pd
+import oracledb
+import sqlparse
+import re
+from flask import Flask, request, jsonify
+from collections import defaultdict
+from llm_utils import get_llm
+
+# ---------- Load config ----------
+with open("config.yaml", "r") as f:
+    config = yaml.safe_load(f)
+
+DB_CONFIG = config["databases"]
+ALLOWED_TABLES = ["employees", "orders", "customers"]
+MAX_ROWS_RETURN = 50
+SESSIONS = defaultdict(dict)
+
+# ---------- Initialize LLMs ----------
+chat_llm, vn = get_llm("gemini")   # chat_llm for conversation, vn for SQL
+
+# Optionally train Vanna on allowed tables
+vn.train(ALLOWED_TABLES)
+
+# ---------- Safety ----------
+def safe_sql_check(sql: str, allowed_tables: list) -> bool:
+    stmts = sqlparse.split(sql)
+    if len(stmts) != 1:
+        return False
+    if not sql.lower().strip().startswith("select"):
+        return False
+    forbidden = re.compile(r"\b(insert|update|delete|drop|alter|truncate|create)\b", re.I)
+    if forbidden.search(sql):
+        return False
+    return any(t in sql.lower() for t in allowed_tables)
+
+# ---------- Run Oracle ----------
+def run_query(instance: str, sql: str):
+    if instance not in DB_CONFIG:
+        raise ValueError(f"Unknown DB instance: {instance}")
+
+    cfg = DB_CONFIG[instance]
+    connection = oracledb.connect(
+        user=cfg["user"], password=cfg["password"], dsn=cfg["dsn"]
+    )
+    with connection.cursor() as cursor:
+        cursor.execute(sql)
+        cols = [col[0] for col in cursor.description]
+        rows = cursor.fetchall()
+    connection.close()
+    return pd.DataFrame(rows, columns=cols)
+
+# ---------- Flask ----------
+app = Flask(__name__)
+
+@app.route("/chat", methods=["POST"])
+def chat():
+    data = request.json or {}
+    session_id = data.get("session_id", "default")
+    nl_query = data.get("nl_query")
+    instance = data.get("instance")
+    state = SESSIONS[session_id]
+
+    if nl_query:
+        state["nl_query"] = nl_query
+
+    if not instance:
+        if "nl_query" not in state:
+            return jsonify({"message": "Please provide a question."})
+        return jsonify({
+            "message": "Which DB instance should I run this on?",
+            "options": list(DB_CONFIG.keys())
+        })
+
+    if "nl_query" not in state:
+        return jsonify({"message": "No question found in session, please ask again."})
+
+    # Use Vanna to generate SQL
+    sql = vn.ask(state["nl_query"])
+
+    if not safe_sql_check(sql, ALLOWED_TABLES):
+        return jsonify({"error": "Unsafe or unapproved SQL generated", "sql": sql})
+
+    try:
+        df = run_query(instance, sql)
+    except Exception as e:
+        return jsonify({"error": str(e), "sql": sql})
+
+    return jsonify({
+        "sql": sql,
+        "columns": list(df.columns),
+        "rows": df.head(MAX_ROWS_RETURN).to_dict(orient="records"),
+        "total_rows": len(df),
+        "message": "Here are your results."
+    })
+
+@app.route("/health")
+def health():
+    return {"status": "ok"}
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=True)
+
+
+"""""""""""
+            
+
+
+
+
+
+
+
+
 import re
 import sqlparse
 import pandas as pd
