@@ -1,29 +1,29 @@
 
 databases:
   db1:
-    user: "${DB1_USER}"
-    password: "${DB1_PASS}"
-    dsn: "${DB1_DSN}"
+    user: "scott"
+    password: "tiger"
+    dsn: "localhost:1521/ORCLPDB1"
     owner: "SCOTT"
   db2:
-    user: "${DB2_USER}"
-    password: "${DB2_PASS}"
-    dsn: "${DB2_DSN}"
+    user: "scott"
+    password: "tiger"
+    dsn: "otherhost:1521/ORCLPDB2"
     owner: "SCOTT"
   db3:
-    user: "${DB3_USER}"
-    password: "${DB3_PASS}"
-    dsn: "${DB3_DSN}"
+    user: "hr"
+    password: "hrpass"
+    dsn: "db3host:1521/ORCLPDB3"
     owner: "HR"
   db4:
-    user: "${DB4_USER}"
-    password: "${DB4_PASS}"
-    dsn: "${DB4_DSN}"
+    user: "hr"
+    password: "hrpass"
+    dsn: "db4host:1521/ORCLPDB4"
     owner: "HR"
 
 llm:
   provider: "gemini"
-  api_key: "${GEMINI_API_KEY}"
+  api_key: "your_gemini_api_key_here"
 
 agent:
   max_rows_return: 50
