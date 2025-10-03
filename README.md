@@ -1,20 +1,36 @@
 
-DB1_USER=scott
-DB1_PASS=tiger
-DB1_DSN=localhost:1521/ORCLPDB1
+databases:
+  db1:
+    user: "${DB1_USER}"
+    password: "${DB1_PASS}"
+    dsn: "${DB1_DSN}"
+    owner: "SCOTT"
+  db2:
+    user: "${DB2_USER}"
+    password: "${DB2_PASS}"
+    dsn: "${DB2_DSN}"
+    owner: "SCOTT"
+  db3:
+    user: "${DB3_USER}"
+    password: "${DB3_PASS}"
+    dsn: "${DB3_DSN}"
+    owner: "HR"
+  db4:
+    user: "${DB4_USER}"
+    password: "${DB4_PASS}"
+    dsn: "${DB4_DSN}"
+    owner: "HR"
 
-DB2_USER=scott
-DB2_PASS=tiger
-DB2_DSN=otherhost:1521/ORCLPDB2
+llm:
+  provider: "gemini"
+  api_key: "${GEMINI_API_KEY}"
 
-DB3_USER=hr
-DB3_PASS=hrpass
-DB3_DSN=db3host:1521/ORCLPDB3
+agent:
+  max_rows_return: 50
+  allowed_tables: ["employees", "orders", "customers"]
 
-DB4_USER=hr
-DB4_PASS=hrpass
-DB4_DSN=db4host:1521/ORCLPDB4
 
+  
 
 
 import os
