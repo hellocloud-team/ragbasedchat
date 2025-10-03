@@ -1,4 +1,31 @@
 
+import oracledb
+
+def check_db_connections(db_config: dict):
+    """
+    Loop through all DB instances and try a simple SELECT 1 query.
+    Returns a dict with status per instance.
+    """
+    status = {}
+    for instance, cfg in db_config.items():
+        try:
+            conn = oracledb.connect(
+                user=cfg["user"], password=cfg["password"], dsn=cfg["dsn"]
+            )
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM dual")
+                cur.fetchone()
+            conn.close()
+            status[instance] = "OK"
+        except Exception as e:
+            status[instance] = f"FAILED: {str(e)}"
+    return status
+
+    
+
+
+
+
 from langchain_openai import ChatOpenAI
 from vanna.remote import VannaDefault
 import os
